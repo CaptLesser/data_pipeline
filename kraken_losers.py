@@ -6,8 +6,13 @@ price drops).
 """
 
 import argparse
+import logging
 import requests
 import pandas as pd
+
+
+class KrakenAPIError(Exception):
+    """Raised when the Kraken API returns an error or invalid data."""
 
 STABLE_COINS = {"USDT", "USDC", "DAI"}
 
@@ -18,11 +23,14 @@ def get_usd_pairs():
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
         data = resp.json()
-    except requests.RequestException as exc:
-        raise SystemExit(f"Error fetching asset pairs: {exc}")
+    except (requests.RequestException, ValueError) as exc:
+        raise KrakenAPIError(f"Error fetching asset pairs: {exc}") from exc
     if data.get("error"):
-        raise SystemExit(f"Kraken API error: {data['error']}")
-    pairs = data["result"]
+        raise KrakenAPIError(f"Kraken API error: {data['error']}")
+    try:
+        pairs = data["result"]
+    except KeyError as exc:
+        raise KrakenAPIError("Malformed response: missing 'result'") from exc
     usd_pairs = [k for k, v in pairs.items() if v.get("wsname", "").endswith("USD")]
     return usd_pairs
 
@@ -38,11 +46,14 @@ def fetch_ticker_data(pairs):
             resp = requests.get(url, params={"pair": chunk}, timeout=10)
             resp.raise_for_status()
             data = resp.json()
-        except requests.RequestException as exc:
-            raise SystemExit(f"Error fetching ticker data: {exc}")
+        except (requests.RequestException, ValueError) as exc:
+            raise KrakenAPIError(f"Error fetching ticker data: {exc}") from exc
         if data.get("error"):
-            raise SystemExit(f"Kraken API error for chunk {chunk}: {data['error']}")
-        all_data.update(data["result"])
+            raise KrakenAPIError(f"Kraken API error for chunk {chunk}: {data['error']}")
+        try:
+            all_data.update(data["result"])
+        except KeyError as exc:
+            raise KrakenAPIError("Malformed response: missing 'result'") from exc
     return all_data
 
 
@@ -50,6 +61,8 @@ def exclude_stable_pairs(df: pd.DataFrame) -> pd.DataFrame:
     """Remove rows where the base asset is a stablecoin."""
     base_assets = df["symbol"].str[:-3]
     return df[~base_assets.isin(STABLE_COINS)]
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Fetch top 24h losers (biggest price drops) on Kraken.",
@@ -74,10 +87,15 @@ def main():
     )
     args = parser.parse_args()
 
-    usd_pairs = get_usd_pairs()
-    print(f"Found {len(usd_pairs)} USD pairs on Kraken.")
+    logging.basicConfig(level=logging.INFO)
 
-    ticker = fetch_ticker_data(usd_pairs)
+    try:
+        usd_pairs = get_usd_pairs()
+        logging.info("Found %d USD pairs on Kraken.", len(usd_pairs))
+        ticker = fetch_ticker_data(usd_pairs)
+    except KrakenAPIError as exc:
+        raise SystemExit(str(exc)) from exc
+
     rows = []
     for sym, vals in ticker.items():
         try:
@@ -85,17 +103,18 @@ def main():
             last = float(vals["c"][0])
             volume = float(vals["v"][1])  # 24h rolling volume
             pct_change = 100 * (last - open_) / open_
-            rows.append(
-                {
-                    "symbol": sym,
-                    "open": open_,
-                    "last": last,
-                    "pct_change": pct_change,
-                    "volume": volume,
-                }
-            )
-        except Exception:
+        except (KeyError, TypeError, ValueError) as exc:
+            logging.debug("Skipping %s due to invalid data: %s", sym, exc)
             continue
+        rows.append(
+            {
+                "symbol": sym,
+                "open": open_,
+                "last": last,
+                "pct_change": pct_change,
+                "volume": volume,
+            }
+        )
 
     df = pd.DataFrame(rows)
     if not args.include_stables:

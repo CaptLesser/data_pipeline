@@ -17,7 +17,6 @@ import requests
 
 import kraken_losers as kl
 
-
 def test_exclude_stable_pairs_filters_only_stables():
     """Stablecoin pairs should be removed from the DataFrame."""
     df = pd.DataFrame(
@@ -30,7 +29,6 @@ def test_exclude_stable_pairs_filters_only_stables():
     filtered = kl.exclude_stable_pairs(df)
 
     assert set(filtered["symbol"]) == {"BTCUSD", "ETHUSD"}
-
 
 def test_get_usd_pairs_fetches_usd_pairs(monkeypatch):
     """Only trading pairs quoted in USD should be returned."""
@@ -112,5 +110,3 @@ def test_fetch_ticker_data_raises_on_request_error(monkeypatch):
 
     with pytest.raises(SystemExit):
         kl.fetch_ticker_data(["BTCUSD"])
-
-
