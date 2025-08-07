@@ -10,10 +10,6 @@ import logging
 import requests
 import pandas as pd
 
-
-class KrakenAPIError(Exception):
-    """Raised when the Kraken API returns an error or invalid data."""
-
 STABLE_COINS = {"USDT", "USDC", "DAI"}
 
 def get_usd_pairs():
@@ -24,13 +20,13 @@ def get_usd_pairs():
         resp.raise_for_status()
         data = resp.json()
     except (requests.RequestException, ValueError) as exc:
-        raise KrakenAPIError(f"Error fetching asset pairs: {exc}") from exc
+        raise SystemExit(f"Error fetching asset pairs: {exc}") from exc
     if data.get("error"):
-        raise KrakenAPIError(f"Kraken API error: {data['error']}")
+        raise SystemExit(f"Kraken API error: {data['error']}")
     try:
         pairs = data["result"]
     except KeyError as exc:
-        raise KrakenAPIError("Malformed response: missing 'result'") from exc
+        raise SystemExit("Malformed response: missing 'result'") from exc
     usd_pairs = [k for k, v in pairs.items() if v.get("wsname", "").endswith("USD")]
     return usd_pairs
 
@@ -47,13 +43,13 @@ def fetch_ticker_data(pairs):
             resp.raise_for_status()
             data = resp.json()
         except (requests.RequestException, ValueError) as exc:
-            raise KrakenAPIError(f"Error fetching ticker data: {exc}") from exc
+            raise SystemExit(f"Error fetching ticker data: {exc}") from exc
         if data.get("error"):
-            raise KrakenAPIError(f"Kraken API error for chunk {chunk}: {data['error']}")
+            raise SystemExit(f"Kraken API error for chunk {chunk}: {data['error']}")
         try:
             all_data.update(data["result"])
         except KeyError as exc:
-            raise KrakenAPIError("Malformed response: missing 'result'") from exc
+            raise SystemExit("Malformed response: missing 'result'") from exc
     return all_data
 
 
@@ -89,12 +85,9 @@ def main():
 
     logging.basicConfig(level=logging.INFO)
 
-    try:
-        usd_pairs = get_usd_pairs()
-        logging.info("Found %d USD pairs on Kraken.", len(usd_pairs))
-        ticker = fetch_ticker_data(usd_pairs)
-    except KrakenAPIError as exc:
-        raise SystemExit(str(exc)) from exc
+    usd_pairs = get_usd_pairs()
+    logging.info("Found %d USD pairs on Kraken.", len(usd_pairs))
+    ticker = fetch_ticker_data(usd_pairs)
 
     rows = []
     for sym, vals in ticker.items():
@@ -102,8 +95,10 @@ def main():
             open_ = float(vals["o"])
             last = float(vals["c"][0])
             volume = float(vals["v"][1])  # 24h rolling volume
+            if open_ == 0:
+                raise ValueError("open price is zero")
             pct_change = 100 * (last - open_) / open_
-        except (KeyError, TypeError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError, ZeroDivisionError) as exc:
             logging.debug("Skipping %s due to invalid data: %s", sym, exc)
             continue
         rows.append(
