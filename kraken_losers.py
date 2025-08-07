@@ -9,9 +9,7 @@ import argparse
 import requests
 import pandas as pd
 
-
 STABLE_COINS = {"USDT", "USDC", "DAI"}
-
 
 def get_usd_pairs():
     """Get all USD trading pairs from Kraken"""
@@ -52,8 +50,6 @@ def exclude_stable_pairs(df: pd.DataFrame) -> pd.DataFrame:
     """Remove rows where the base asset is a stablecoin."""
     base_assets = df["symbol"].str[:-3]
     return df[~base_assets.isin(STABLE_COINS)]
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Fetch top 24h losers (biggest price drops) on Kraken.",
