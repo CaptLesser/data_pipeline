@@ -31,6 +31,16 @@ A Python-based cryptocurrency quant research toolkit and pipeline.
 
 Outputs a CSV and prints top 24h price drops to the terminal.
 
+## Testing
+
+Run the unit tests with [pytest](https://docs.pytest.org/):
+
+```sh
+pytest
+```
+
+The suite mocks Kraken API responses, so no external network access is required.
+
 ## Contributing
 
 Pull requests and issues welcome!
