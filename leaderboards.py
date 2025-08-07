@@ -5,13 +5,13 @@ overlap coins based on OHLCVT minute bars stored in MySQL.
 
 Workflow:
 1. Filter for coins with recent data (within 1 day of now)
-2. For each coin, pull 30-day minute-level data
-3. Slice into rolling windows: 6h, 24h, 72h, 168h
+2. Pull 30-day minute-level data for all coins in a single query
+3. Slice into disjoint windows: 6h, 24h, 72h, 168h
 4. Calculate:
    - Price % change per window
    - Total volume per window
-   - Volume % change vs. previous window
-5. Rank coins for each window & metric
+   - Volume % change vs. previous disjoint window
+5. Rank coins for each window & metric using top-N appearances
 6. Aggregate counts over 30 days to find habitual losers/gainers/overlaps
 7. Perform clustering (HDBSCAN) to detect disproportional "bucket skew"
 8. Output CSVs containing full time series for qualifying coins
@@ -49,34 +49,37 @@ def get_db_connection(host: str, user: str, password: str, database: str, port: 
 # Step 1: Filter recent coins
 # ------------------------
 def get_recent_coins(conn: mysql.connector.MySQLConnection) -> List[str]:
-    """Return coins with data within the last day."""
+    """Return coins with data within the last day (UTC)."""
     query = f"""
     SELECT symbol
     FROM {TABLE_NAME}
     GROUP BY symbol
-    HAVING MAX(timestamp) >= NOW() - INTERVAL 1 DAY
+    HAVING MAX(timestamp) >= UTC_TIMESTAMP() - INTERVAL 1 DAY
     """
     return pd.read_sql(query, conn)["symbol"].tolist()
 
 # ------------------------
 # Step 2: Pull full 30-day data
 # ------------------------
-def get_coin_history(conn: mysql.connector.MySQLConnection, symbol: str) -> pd.DataFrame:
-    """Retrieve full 30-day minute OHLCVT history for a symbol."""
+def get_all_coin_history(conn: mysql.connector.MySQLConnection, symbols: List[str]) -> pd.DataFrame:
+    """Retrieve full 30-day minute OHLCVT history for all symbols in one pull."""
+    if not symbols:
+        return pd.DataFrame(columns=["symbol", "timestamp", "open", "high", "low", "close", "volume"])
+    placeholders = ",".join(["%s"] * len(symbols))
     query = f"""
-    SELECT timestamp, open, high, low, close, volume
+    SELECT symbol, timestamp, open, high, low, close, volume
     FROM {TABLE_NAME}
-    WHERE symbol = %s
-      AND timestamp >= NOW() - INTERVAL 30 DAY
-    ORDER BY timestamp ASC
+    WHERE symbol IN ({placeholders})
+      AND timestamp >= UTC_TIMESTAMP() - INTERVAL 30 DAY
+    ORDER BY symbol ASC, timestamp ASC
     """
-    return pd.read_sql(query, conn, params=[symbol])
+    return pd.read_sql(query, conn, params=symbols)
 
 # ------------------------
 # Step 3-4: Compute window metrics
 # ------------------------
 def compute_window_stats(df: pd.DataFrame, window_hours: int) -> pd.DataFrame:
-    """Create rolling lookback windows and compute metrics.
+    """Slice data into disjoint windows and compute metrics.
 
     Parameters
     ----------
@@ -92,60 +95,79 @@ def compute_window_stats(df: pd.DataFrame, window_hours: int) -> pd.DataFrame:
         total_volume, pct_vol_change.
     """
 
-    window_bars = window_hours * 60
-    df = df.sort_values("timestamp").reset_index(drop=True)
+    if df.empty:
+        return pd.DataFrame(columns=["window_start", "price_change", "total_volume", "pct_vol_change"])
 
-    # Rolling metrics using trailing windows for efficiency
-    open_shifted = df["open"].shift(window_bars - 1)
-    close_price = df["close"]
-    price_change = ((close_price - open_shifted) / open_shifted) * 100
+    df = df.sort_values("timestamp").set_index("timestamp")
 
-    total_volume = df["volume"].rolling(window_bars).sum()
+    resampled = (
+        df.resample(f"{window_hours}H", label="left", closed="left", origin="unix")
+        .agg({"open": "first", "close": "last", "volume": "sum"})
+        .dropna()
+    )
+
+    price_change = ((resampled["close"] - resampled["open"]) / resampled["open"]) * 100
+    total_volume = resampled["volume"]
     pct_vol_change = total_volume.pct_change() * 100
 
-    window_start = df["timestamp"].shift(window_bars - 1)
     stats = pd.DataFrame(
         {
-            "window_start": window_start,
+            "window_start": resampled.index,
             "price_change": price_change,
             "total_volume": total_volume,
             "pct_vol_change": pct_vol_change,
         }
-    )
+    ).dropna().reset_index(drop=True)
 
-    # Drop incomplete windows at the start of the series
-    return stats.dropna().reset_index(drop=True)
+    return stats
 
 # ------------------------
 # Step 5-6: Ranking & aggregation
 # ------------------------
 def build_leaderboards(
-    all_stats: Dict[str, Dict[int, pd.DataFrame]],
+    all_window_stats: Dict[int, pd.DataFrame],
     top_n: int = 20,
 ) -> Tuple[List[str], List[str], List[str], Dict[str, Counter[str]]]:
-    """Aggregate window metrics to produce leaderboards and bucket counts."""
+    """Aggregate top-N window appearances to produce leaderboards."""
 
     loser_counts: Counter[str] = Counter()
     gainer_counts: Counter[str] = Counter()
     bucket_counts: Dict[str, Counter[str]] = defaultdict(Counter)
 
-    for coin, windows in all_stats.items():
-        for window, window_df in windows.items():
-            bucket = f"{window}h"
+    for window, df in all_window_stats.items():
+        bucket = f"{window}h"
+        if df.empty:
+            continue
+        for _, group in df.groupby("window_start"):
+            top_losers = (
+                group[group["price_change"] < 0]
+                .nsmallest(top_n, "price_change")["symbol"]
+            )
+            for sym in top_losers:
+                loser_counts[sym] += 1
+                bucket_counts[sym][f"price_{bucket}_loss"] += 1
 
-            changes = window_df["price_change"]
-            losers = int((changes < 0).sum())
-            gainers = int((changes > 0).sum())
-            loser_counts[coin] += losers
-            gainer_counts[coin] += gainers
-            bucket_counts[coin][f"price_{bucket}_loss"] += losers
-            bucket_counts[coin][f"price_{bucket}_gain"] += gainers
+            top_gainers = (
+                group[group["price_change"] > 0]
+                .nlargest(top_n, "price_change")["symbol"]
+            )
+            for sym in top_gainers:
+                gainer_counts[sym] += 1
+                bucket_counts[sym][f"price_{bucket}_gain"] += 1
 
-            vol_changes = window_df["pct_vol_change"]
-            vol_drop = int((vol_changes < 0).sum())
-            vol_spike = int((vol_changes > 0).sum())
-            bucket_counts[coin][f"vol_{bucket}_drop"] += vol_drop
-            bucket_counts[coin][f"vol_{bucket}_spike"] += vol_spike
+            vol_drop = (
+                group[group["pct_vol_change"] < 0]
+                .nsmallest(top_n, "pct_vol_change")["symbol"]
+            )
+            for sym in vol_drop:
+                bucket_counts[sym][f"vol_{bucket}_drop"] += 1
+
+            vol_spike = (
+                group[group["pct_vol_change"] > 0]
+                .nlargest(top_n, "pct_vol_change")["symbol"]
+            )
+            for sym in vol_spike:
+                bucket_counts[sym][f"vol_{bucket}_spike"] += 1
 
     habitual_losers = [c for c, _ in loser_counts.most_common(top_n)]
     habitual_gainers = [c for c, _ in gainer_counts.most_common(top_n)]
@@ -155,58 +177,64 @@ def build_leaderboards(
 # ------------------------
 # Step 7: Bucket skew detection with HDBSCAN
 # ------------------------
-def detect_skew(bucket_counts: Dict[str, Counter[str]]) -> Dict[str, Dict[str, int]]:
-    """Cluster bucket appearance vectors to detect skew using HDBSCAN."""
+def detect_skew(bucket_counts: Dict[str, Counter[str]]) -> Dict[str, Dict[str, float]]:
+    """Cluster normalized bucket vectors to detect disproportionate skew."""
     if not bucket_counts:
         return {}
 
-    # Determine full list of buckets
     buckets = sorted({b for counts in bucket_counts.values() for b in counts})
 
     data = []
     coins = []
     for coin, counts in bucket_counts.items():
-        data.append([counts.get(b, 0) for b in buckets])
+        total = sum(counts.values())
+        vec = [counts.get(b, 0) / total if total else 0 for b in buckets]
+        data.append(vec)
         coins.append(coin)
 
-    # If there aren't enough samples, return non-skewed results without clustering
-    if len(data) < 2:
-        result: Dict[str, Dict[str, int]] = {}
-        for coin, counts in zip(coins, data):
-            dominant_idx = int(np.argmax(counts)) if counts else 0
+    X = np.array(data)
+    if len(X) < 2:
+        result: Dict[str, Dict[str, float]] = {}
+        for coin, vec in zip(coins, X):
+            dominant_idx = int(np.argmax(vec)) if len(vec) else 0
+            dominant_bucket = buckets[dominant_idx] if buckets else ""
             result[coin] = {
                 "skewed": 0,
                 "cluster": 0,
-                "dominant_bucket": buckets[dominant_idx] if buckets else "",
+                "dominant_bucket": dominant_bucket,
+                "skew_strength": float(vec[dominant_idx]) if len(vec) else 0.0,
             }
         return result
 
     clusterer = hdbscan.HDBSCAN(min_cluster_size=2)
-    labels = clusterer.fit_predict(np.array(data))
+    labels = clusterer.fit_predict(X)
 
-    result: Dict[str, Dict[str, int]] = {}
-    for coin, label, counts in zip(coins, labels, data):
-        dominant_idx = int(np.argmax(counts)) if counts else 0
-        dominant_bucket = buckets[dominant_idx] if buckets else ""
-        result[coin] = {
-            "skewed": int(label == -1),
-            "cluster": int(label),
-            "dominant_bucket": dominant_bucket,
-        }
+    result: Dict[str, Dict[str, float]] = {}
+    for label in set(labels):
+        cluster_mask = labels == label
+        cluster_dom = np.median(np.max(X[cluster_mask], axis=1)) if cluster_mask.any() else 0
+        for idx in np.where(cluster_mask)[0]:
+            vec = X[idx]
+            dominant_idx = int(np.argmax(vec)) if len(vec) else 0
+            dominant_bucket = buckets[dominant_idx] if buckets else ""
+            dominant_share = float(vec[dominant_idx]) if len(vec) else 0.0
+            skewed = int(dominant_share > cluster_dom + 0.1)
+            result[coins[idx]] = {
+                "skewed": skewed,
+                "cluster": int(label),
+                "dominant_bucket": dominant_bucket,
+                "skew_strength": dominant_share,
+            }
     return result
 
 # ------------------------
 # Step 8: Save CSVs
 # ------------------------
-def save_full_timeseries_csv(symbol_list: Iterable[str], conn: mysql.connector.MySQLConnection, filename: str) -> None:
+def save_full_timeseries_csv(symbol_list: Iterable[str], history: pd.DataFrame, filename: str) -> None:
     """Save full 30-day timeseries for symbols to a CSV."""
-    all_data: List[pd.DataFrame] = []
-    for sym in symbol_list:
-        df = get_coin_history(conn, sym)
-        df["symbol"] = sym
-        all_data.append(df)
-    if all_data:
-        pd.concat(all_data).to_csv(filename, index=False)
+    subset = history[history["symbol"].isin(list(symbol_list))]
+    if not subset.empty:
+        subset.to_csv(filename, index=False)
 
 # ------------------------
 # Step 9: Main routine
@@ -235,15 +263,22 @@ def main() -> None:
     coins = get_recent_coins(conn)
     print(f"Found {len(coins)} coins with fresh data.")
 
-    all_stats: Dict[str, Dict[int, pd.DataFrame]] = {}
-    for coin in coins:
-        df = get_coin_history(conn, coin)
-        all_stats[coin] = {}
-        for window in [6, 24, 72, 168]:
-            all_stats[coin][window] = compute_window_stats(df, window)
+    history_df = get_all_coin_history(conn, coins)
+
+    window_stats: Dict[int, List[pd.DataFrame]] = {6: [], 24: [], 72: [], 168: []}
+    for symbol, sym_df in history_df.groupby("symbol"):
+        for window in window_stats.keys():
+            stats = compute_window_stats(sym_df.copy(), window)
+            stats["symbol"] = symbol
+            window_stats[window].append(stats)
+
+    aggregated_stats = {
+        window: pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+        for window, dfs in window_stats.items()
+    }
 
     losers, gainers, overlaps, bucket_counts = build_leaderboards(
-        all_stats, top_n=args.top_n
+        aggregated_stats, top_n=args.top_n
     )
     skew_info = detect_skew(bucket_counts)
 
@@ -252,9 +287,9 @@ def main() -> None:
     print("\nOverlaps:", overlaps)
     print("\nSkew Analysis:", skew_info)
 
-    save_full_timeseries_csv(losers, conn, "habitual_losers.csv")
-    save_full_timeseries_csv(gainers, conn, "habitual_gainers.csv")
-    save_full_timeseries_csv(overlaps, conn, "habitual_overlaps.csv")
+    save_full_timeseries_csv(losers, history_df, "habitual_losers.csv")
+    save_full_timeseries_csv(gainers, history_df, "habitual_gainers.csv")
+    save_full_timeseries_csv(overlaps, history_df, "habitual_overlaps.csv")
 
     conn.close()
 
