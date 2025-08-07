@@ -1,14 +1,16 @@
-"""
-kraken_losers.py
+"""kraken_losers.py
 
-Fetches all USD-quoted crypto asset pairs from Kraken,
-retrieves 24-hour price data, computes % change, and
-outputs the top N "losers" (biggest price drops).
+Fetches all USD-quoted crypto asset pairs from Kraken, retrieves 24-hour
+price data, computes % change, and outputs the top N "losers" (biggest
+price drops).
 """
 
 import argparse
 import requests
 import pandas as pd
+
+
+STABLE_COINS = {"USDT", "USDC", "DAI"}
 
 
 def get_usd_pairs():
@@ -17,9 +19,12 @@ def get_usd_pairs():
     try:
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
+        data = resp.json()
     except requests.RequestException as exc:
         raise SystemExit(f"Error fetching asset pairs: {exc}")
-    pairs = resp.json()["result"]
+    if data.get("error"):
+        raise SystemExit(f"Kraken API error: {data['error']}")
+    pairs = data["result"]
     usd_pairs = [k for k, v in pairs.items() if v.get("wsname", "").endswith("USD")]
     return usd_pairs
 
@@ -34,10 +39,19 @@ def fetch_ticker_data(pairs):
         try:
             resp = requests.get(url, params={"pair": chunk}, timeout=10)
             resp.raise_for_status()
+            data = resp.json()
         except requests.RequestException as exc:
             raise SystemExit(f"Error fetching ticker data: {exc}")
-        all_data.update(resp.json()["result"])
+        if data.get("error"):
+            raise SystemExit(f"Kraken API error for chunk {chunk}: {data['error']}")
+        all_data.update(data["result"])
     return all_data
+
+
+def exclude_stable_pairs(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove rows where the base asset is a stablecoin."""
+    base_assets = df["symbol"].str[:-3]
+    return df[~base_assets.isin(STABLE_COINS)]
 
 
 def main():
@@ -89,10 +103,7 @@ def main():
 
     df = pd.DataFrame(rows)
     if not args.include_stables:
-        # Quick filter for common USD stablecoins by checking the base asset
-        stables = {"USDT", "USDC", "DAI"}
-        base_assets = df["symbol"].str.slice(stop=-3)
-        df = df[~base_assets.isin(stables)]
+        df = exclude_stable_pairs(df)
     df = df[df["volume"] >= args.min_volume]
     df = df.sort_values("pct_change").reset_index(drop=True)
 
