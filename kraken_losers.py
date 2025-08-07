@@ -13,6 +13,7 @@ import pandas as pd
 TOP_N = 20        # Number of top losers to display/save
 MIN_VOLUME = 1000 # Minimum 24h volume to include (adjust as needed)
 EXCLUDE_STABLES = True  # Exclude known stables (rudimentary, improve as needed)
+STABLE_COINS = {"USDT", "USDC", "DAI"}
 
 def get_usd_pairs():
     """Get all USD trading pairs from Kraken"""
@@ -31,6 +32,17 @@ def fetch_ticker_data(pairs):
         resp = requests.get(url, params={"pair": chunk}).json()['result']
         all_data.update(resp)
     return all_data
+
+
+def exclude_stable_pairs(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove rows where the base asset is a stablecoin.
+
+    Kraken pair symbols are quoted in USD, so the base asset can be
+    determined by stripping the trailing ``USD``. Pairs whose base asset is
+    a stablecoin (e.g. USDTUSD) should be excluded from the losers list.
+    """
+    base_assets = df["symbol"].str[:-3]
+    return df[~base_assets.isin(STABLE_COINS)]
 
 def main():
     usd_pairs = get_usd_pairs()
@@ -56,9 +68,7 @@ def main():
 
     df = pd.DataFrame(rows)
     if EXCLUDE_STABLES:
-        # Quick filter for stables (improve as needed)
-        stables = ['USDT', 'USDC', 'USD', 'DAI']
-        df = df[~df['symbol'].str.contains('|'.join(stables))]
+        df = exclude_stable_pairs(df)
     df = df[df['volume'] >= MIN_VOLUME]
     df = df.sort_values('pct_change').reset_index(drop=True)
 
