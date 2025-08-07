@@ -17,7 +17,15 @@ EXCLUDE_STABLES = True  # Exclude known stables (rudimentary, improve as needed)
 def get_usd_pairs():
     """Get all USD trading pairs from Kraken"""
     url = "https://api.kraken.com/0/public/AssetPairs"
-    pairs = requests.get(url).json()['result']
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        raise RuntimeError(f"Failed to fetch asset pairs: {e}") from e
+    if data.get('error'):
+        raise RuntimeError(f"Kraken API error: {data['error']}")
+    pairs = data['result']
     usd_pairs = [k for k, v in pairs.items() if v.get('wsname', '').endswith('USD')]
     return usd_pairs
 
@@ -28,8 +36,16 @@ def fetch_ticker_data(pairs):
     all_data = {}
     for i in range(0, len(pairs), chunk_size):
         chunk = ",".join(pairs[i:i+chunk_size])
-        resp = requests.get(url, params={"pair": chunk}).json()['result']
-        all_data.update(resp)
+        try:
+            resp = requests.get(url, params={"pair": chunk}, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.RequestException as e:
+            raise RuntimeError(f"Failed to fetch ticker data: {e}") from e
+        if data.get('error'):
+            raise RuntimeError(f"Kraken API error for chunk {chunk}: {data['error']}")
+        resp_data = data['result']
+        all_data.update(resp_data)
     return all_data
 
 def main():
