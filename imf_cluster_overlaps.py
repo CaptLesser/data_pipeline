@@ -12,7 +12,6 @@ from sklearn.preprocessing import RobustScaler
 from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics import silhouette_score
 from kneed import KneeLocator
-import matplotlib.pyplot as plt
 import functools
 from typing import List, Dict, Any
 
@@ -40,7 +39,7 @@ GMM_MAX_COMPONENTS = {0.25: 5, 0.5: 5, 1: 5, 3: 10, 7: 10, 30: 15}
 DBSCAN_MIN_SAMPLES_RANGE = range(2, 8)  # trying min_samples between 2 and 7 inclusive.
 DBSCAN_EPS_PERCENTILES   = (10, 90)     # Use 10th to 90th percentile of kth distances for eps grid.
 DBSCAN_EPS_GRID_SIZE     = 10           # Number of eps candidates.
-PLOT_K_DIST              = True
+MIN_REQUIRED_POINTS      = 100
 
 OUTPUT_FILE = 'imf_clusters_overlaps.json'
 LOG_FILE    = 'pipeline.log'
@@ -75,40 +74,28 @@ def log_enter_exit(func):
 
 # ─── FETCH & PAD SERIES ───────────────────────────────────────────────────
 @log_enter_exit
-def fetch_clean_series(symbol: str, days: float) -> pd.Series:
+def fetch_clean_series(symbol: str) -> pd.Series:
     """Fetch closing-price series at 1-min cadence from the CSV dataframe."""
-    logger.info("Fetching price for %s over last %s day(s)", symbol, days)
-    symbol_df = DF[DF['symbol'] == symbol]
+    symbol_df = DF[DF['symbol'] == symbol].sort_values('timestamp')
     if symbol_df.empty:
         return pd.Series(dtype=float)
-    symbol_df = symbol_df.sort_values('timestamp')
-    latest = symbol_df['timestamp'].max()
-    start = latest - timedelta(days=days)
-    symbol_df = symbol_df[symbol_df['timestamp'] >= start]
-    if symbol_df.empty:
-        return pd.Series(dtype=float)
-    symbol_df = symbol_df.set_index('timestamp')
-    full_idx = pd.date_range(symbol_df.index.min(), symbol_df.index.max(), freq='min')
-    symbol_df = symbol_df.reindex(full_idx)
+    full_idx = pd.date_range(start=symbol_df['timestamp'].min(),
+                             end=symbol_df['timestamp'].max(),
+                             freq='min')
+    symbol_df = symbol_df.set_index('timestamp').reindex(full_idx)
     symbol_df['close'] = symbol_df['close'].ffill().bfill().astype(float)
     return symbol_df['close']
 
 @log_enter_exit
-def fetch_volume_series(symbol: str, days: float) -> pd.Series:
+def fetch_volume_series(symbol: str) -> pd.Series:
     """Fetch volume series at 1-min cadence from the CSV dataframe."""
-    logger.info("Fetching volume for %s over last %s day(s)", symbol, days)
-    symbol_df = DF[DF['symbol'] == symbol]
+    symbol_df = DF[DF['symbol'] == symbol].sort_values('timestamp')
     if symbol_df.empty:
         return pd.Series(dtype=float)
-    symbol_df = symbol_df.sort_values('timestamp')
-    latest = symbol_df['timestamp'].max()
-    start = latest - timedelta(days=days)
-    symbol_df = symbol_df[symbol_df['timestamp'] >= start]
-    if symbol_df.empty:
-        return pd.Series(dtype=float)
-    symbol_df = symbol_df.set_index('timestamp')
-    full_idx = pd.date_range(symbol_df.index.min(), symbol_df.index.max(), freq='min')
-    symbol_df = symbol_df.reindex(full_idx)
+    full_idx = pd.date_range(start=symbol_df['timestamp'].min(),
+                             end=symbol_df['timestamp'].max(),
+                             freq='min')
+    symbol_df = symbol_df.set_index('timestamp').reindex(full_idx)
     symbol_df['volume'] = symbol_df['volume'].fillna(0).astype(float)
     return symbol_df['volume']
 
@@ -269,9 +256,15 @@ def cluster_and_summarize(df: pd.DataFrame, days: int) -> dict:
     if best_params is None:
         logger.warning("Could not determine optimal DBSCAN parameters; using default knee locator eps.")
         # Fallback: use knee locator method if grid search fails.
-        idxs = np.arange(len(np.sort(kth_dists)))
-        kl = KneeLocator(idxs, np.sort(kth_dists), curve="convex", direction="increasing")
-        eps = float(np.sort(kth_dists)[kl.knee]) if kl.knee is not None else float(np.percentile(kth_dists, 50))
+        sorted_kth = np.sort(kth_dists)
+        if len(sorted_kth) == 0:
+            eps = 0.5
+        elif np.allclose(sorted_kth[0], sorted_kth[-1]):
+            eps = float(sorted_kth[0])
+        else:
+            idxs = np.arange(len(sorted_kth))
+            kl = KneeLocator(idxs, sorted_kth, curve="convex", direction="increasing")
+            eps = float(sorted_kth[int(kl.knee)]) if kl.knee is not None else float(np.percentile(sorted_kth, 50))
         best_params = {'eps': eps, 'min_samples': 2}
         db = DBSCAN(eps=eps, min_samples=2).fit(Xs)
         best_labels = db.labels_
@@ -313,18 +306,6 @@ def cluster_and_summarize(df: pd.DataFrame, days: int) -> dict:
             cluster_summary['flag_small'] = False
         result['dbscan'].append(cluster_summary)
 
-    if PLOT_K_DIST:
-        plt.figure(figsize=(6, 3))
-        sorted_kth = np.sort(kth_dists)
-        idxs = np.arange(len(sorted_kth))
-        plt.plot(idxs, sorted_kth, label=f"{k_for_dist}-NN")
-        plt.xlabel("Sorted point index")
-        plt.ylabel("k-dist")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(f"k_distance_{days}d.png")
-        plt.close()
-
     return result
 
 # ─── RUN PER ASSET ───────────────────────────────────────────────────────
@@ -332,10 +313,18 @@ def cluster_and_summarize(df: pd.DataFrame, days: int) -> dict:
 def run_asset(symbol: str, days: float) -> dict:
     label = WINDOW_LABELS.get(days, f"{days}d")
     # 1) Fetch the original price and volume series.
-    price_s = fetch_clean_series(symbol, days)
-    vol_s   = fetch_volume_series(symbol, days)
-    if price_s.empty or vol_s.empty:
+    price_full = fetch_clean_series(symbol)
+    vol_full   = fetch_volume_series(symbol)
+    if price_full.empty or vol_full.empty:
         logger.warning("Missing series for %s %s", symbol, label)
+        return {'gmm': [], 'dbscan': []}
+    latest = price_full.index.max()
+    start = latest - timedelta(days=days)
+    price_s = price_full[price_full.index >= start]
+    vol_s   = vol_full[vol_full.index >= start]
+    if price_s.empty or price_s.isna().all() or len(price_s.dropna()) < MIN_REQUIRED_POINTS:
+        print(f"Skipping {symbol}: insufficient data")
+        logger.warning("Skipping %s %s: insufficient data", symbol, label)
         return {'gmm': [], 'dbscan': []}
 
     # 2) Decompose into IMF dataframes for price and volume separately.
@@ -414,6 +403,25 @@ def main():
     with open(OUTPUT_FILE, 'w') as fp:
         json.dump(summary, fp, indent=2)
     logger.info("Wrote %s", OUTPUT_FILE)
+
+    # Write human-readable summary
+    lines = []
+    for coin, windows in summary.items():
+        dominant = None
+        for result in windows.values():
+            clusters = result.get('gmm', []) or result.get('dbscan', [])
+            for cl in clusters:
+                if dominant is None or cl.get('median_amplitude_pct', 0) > dominant.get('median_amplitude_pct', 0):
+                    dominant = cl
+        if dominant:
+            line = f"{coin}, {dominant['median_duration_min']}, {dominant['median_amplitude_pct']}"
+        else:
+            line = f"{coin}, NA, NA"
+        lines.append(line)
+    with open('imf_clusters_overlaps.txt', 'w') as tf:
+        tf.write("\n".join(lines))
+
+    logger.info("Wrote imf_clusters_overlaps.txt")
     logger.info("Pipeline finished")
 
 if __name__ == '__main__':
