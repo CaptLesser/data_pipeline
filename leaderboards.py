@@ -75,7 +75,13 @@ def get_all_coin_history(conn: Engine, symbols: List[str]) -> pd.DataFrame:
       AND timestamp >= UTC_TIMESTAMP() - INTERVAL 30 DAY
     ORDER BY symbol ASC, timestamp ASC
     """
-    return pd.read_sql(query, conn, params=symbols)
+    # ``pd.read_sql`` expects the parameters for a statement as a single
+    # sequence (tuple/dict). Passing the ``symbols`` list directly triggers
+    # SQLAlchemy's "executemany" mode and results in
+    # ``ArgumentError: List argument must consist only of tuples or
+    # dictionaries``. Convert to a tuple so the parameters are treated as
+    # one set corresponding to the ``IN`` clause placeholders.
+    return pd.read_sql(query, conn, params=tuple(symbols))
 
 
 # ------------------------
