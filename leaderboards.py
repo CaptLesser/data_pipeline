@@ -101,7 +101,12 @@ def compute_window_stats(df: pd.DataFrame, window_hours: int) -> pd.DataFrame:
     df = df.sort_values("timestamp").set_index("timestamp")
 
     resampled = (
-        df.resample(f"{window_hours}H", label="left", closed="left", origin="unix")
+        df.resample(
+            f"{window_hours}H",
+            label="left",
+            closed="left",
+            origin=df.index[0],
+        )
         .agg({"open": "first", "close": "last", "volume": "sum"})
         .dropna()
     )
@@ -178,14 +183,14 @@ def build_leaderboards(
 # Step 7: Bucket skew detection with HDBSCAN
 # ------------------------
 def detect_skew(bucket_counts: Dict[str, Counter[str]]) -> Dict[str, Dict[str, float]]:
-    """Cluster normalized bucket vectors to detect disproportionate skew."""
+    """Cluster bucket proportion vectors and flag disproportionate skews."""
     if not bucket_counts:
         return {}
 
     buckets = sorted({b for counts in bucket_counts.values() for b in counts})
 
-    data = []
-    coins = []
+    data: List[List[float]] = []
+    coins: List[str] = []
     for coin, counts in bucket_counts.items():
         total = sum(counts.values())
         vec = [counts.get(b, 0) / total if total else 0 for b in buckets]
@@ -193,6 +198,8 @@ def detect_skew(bucket_counts: Dict[str, Counter[str]]) -> Dict[str, Dict[str, f
         coins.append(coin)
 
     X = np.array(data)
+
+    # For very small samples, simply report dominant buckets without skewing.
     if len(X) < 2:
         result: Dict[str, Dict[str, float]] = {}
         for coin, vec in zip(coins, X):
@@ -209,22 +216,34 @@ def detect_skew(bucket_counts: Dict[str, Counter[str]]) -> Dict[str, Dict[str, f
     clusterer = hdbscan.HDBSCAN(min_cluster_size=2)
     labels = clusterer.fit_predict(X)
 
-    result: Dict[str, Dict[str, float]] = {}
+    # Baseline medians for each bucket globally and within each cluster
+    global_median = np.median(X, axis=0)
+    cluster_medians: Dict[int, np.ndarray] = {}
     for label in set(labels):
         cluster_mask = labels == label
-        cluster_dom = np.median(np.max(X[cluster_mask], axis=1)) if cluster_mask.any() else 0
-        for idx in np.where(cluster_mask)[0]:
-            vec = X[idx]
-            dominant_idx = int(np.argmax(vec)) if len(vec) else 0
-            dominant_bucket = buckets[dominant_idx] if buckets else ""
-            dominant_share = float(vec[dominant_idx]) if len(vec) else 0.0
-            skewed = int(dominant_share > cluster_dom + 0.1)
-            result[coins[idx]] = {
-                "skewed": skewed,
-                "cluster": int(label),
-                "dominant_bucket": dominant_bucket,
-                "skew_strength": dominant_share,
-            }
+        cluster_medians[int(label)] = np.median(X[cluster_mask], axis=0)
+
+    result: Dict[str, Dict[str, float]] = {}
+    for idx, (coin, vec) in enumerate(zip(coins, X)):
+        label = int(labels[idx])
+        dominant_idx = int(np.argmax(vec)) if len(vec) else 0
+        dominant_bucket = buckets[dominant_idx] if buckets else ""
+        dominant_share = float(vec[dominant_idx]) if len(vec) else 0.0
+
+        baseline = (
+            cluster_medians[label][dominant_idx]
+            if label != -1
+            else global_median[dominant_idx]
+        )
+        skewed = int(dominant_share > baseline + 0.1)
+
+        result[coin] = {
+            "skewed": skewed,
+            "cluster": label,
+            "dominant_bucket": dominant_bucket,
+            "skew_strength": dominant_share,
+        }
+
     return result
 
 # ------------------------
