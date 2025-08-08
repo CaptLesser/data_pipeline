@@ -20,13 +20,15 @@ Note: Ensure the MySQL table is indexed on (symbol, timestamp) for performance.
 """
 
 import argparse
+import json
 from collections import Counter, defaultdict
 from getpass import getpass
 from typing import Dict, Iterable, List, Tuple
 
 import pandas as pd
 import numpy as np
-import mysql.connector
+from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
 
 TABLE_NAME = "ohlcvt"
 
@@ -36,21 +38,16 @@ TABLE_NAME = "ohlcvt"
 # ------------------------
 def get_db_connection(
     host: str, user: str, password: str, database: str, port: int = 3306
-):
-    """Create and return a connection to the MySQL database."""
-    return mysql.connector.connect(
-        host=host,
-        user=user,
-        password=password,
-        database=database,
-        port=port,
-    )
+) -> Engine:
+    """Create and return a SQLAlchemy engine for the MySQL database."""
+    url = f"mysql+mysqlconnector://{user}:{password}@{host}:{port}/{database}"
+    return create_engine(url)
 
 
 # ------------------------
 # Step 1: Filter recent coins
 # ------------------------
-def get_recent_coins(conn: mysql.connector.MySQLConnection) -> List[str]:
+def get_recent_coins(conn: Engine) -> List[str]:
     """Return coins with data within the last day (UTC)."""
     query = f"""
     SELECT symbol
@@ -64,9 +61,7 @@ def get_recent_coins(conn: mysql.connector.MySQLConnection) -> List[str]:
 # ------------------------
 # Step 2: Pull full 30-day data
 # ------------------------
-def get_all_coin_history(
-    conn: mysql.connector.MySQLConnection, symbols: List[str]
-) -> pd.DataFrame:
+def get_all_coin_history(conn: Engine, symbols: List[str]) -> pd.DataFrame:
     """Retrieve full 30-day minute OHLCVT history for all symbols in one pull."""
     if not symbols:
         return pd.DataFrame(
@@ -371,7 +366,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=3306, help="MySQL port")
     parser.add_argument("--password", help="MySQL password (prompt if omitted)")
     parser.add_argument(
-        "--top-n", type=int, default=20, help="Number of coins per leaderboard",
+        "--top-n", type=int, default=None, help="Number of coins per leaderboard",
     )
     args = parser.parse_args()
 
@@ -390,13 +385,20 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    conn = get_db_connection(
+    if args.top_n is None:
+        top_n_str = input("Enter number of coins per leaderboard [20]: ").strip()
+        try:
+            args.top_n = int(top_n_str) if top_n_str else 20
+        except ValueError:
+            args.top_n = 20
+
+    engine = get_db_connection(
         args.host, args.user, args.password, args.database, args.port
     )
-    coins = get_recent_coins(conn)
+    coins = get_recent_coins(engine)
     print(f"Found {len(coins)} coins with fresh data.")
 
-    history_df = get_all_coin_history(conn, coins)
+    history_df = get_all_coin_history(engine, coins)
 
     window_stats: Dict[int, List[pd.DataFrame]] = {6: [], 24: [], 72: [], 168: []}
     for symbol, sym_df in history_df.groupby("symbol"):
@@ -423,18 +425,30 @@ def main() -> None:
         .to_dict("index")
     )
 
-    def print_section(name: str, coins: List[str]) -> None:
+    summary: Dict[str, Dict[str, List[Dict[str, float]]]] = {}
+
+    def process_section(name: str, coins: List[str]) -> None:
         counts_map = {c: bucket_counts[c] for c in coins if c in bucket_counts}
         skew_info, distances = detect_skew(counts_map)
         tags = compute_profile_tags(counts_map, distances)
 
+        section = {"coins": [], "skew_details": []}
         print(f"\n{name}:")
         for c in coins:
             metrics = latest_24h.get(c, {})
             price = metrics.get("price_change", float("nan"))
             vol = metrics.get("pct_vol_change", float("nan"))
-            tag_str = ", ".join(tags.get(c, [])) or "None"
+            tag_list = tags.get(c, [])
+            tag_str = ", ".join(tag_list) or "None"
             print(f"[{c}] PriceΔ: {price:+.2f}% VolΔ: {vol:+.2f}% Skew: {tag_str}")
+            section["coins"].append(
+                {
+                    "symbol": c,
+                    "price_change": float(price),
+                    "pct_vol_change": float(vol),
+                    "skew": tag_list,
+                }
+            )
 
         if skew_info:
             print(f"\nSkew Details ({name}):")
@@ -444,16 +458,29 @@ def main() -> None:
                     print(
                         f"{coin:<10}{bucket:<20}{info['level']:<10}{info['deviation_pct']:+12.2f}"
                     )
+                    section["skew_details"].append(
+                        {
+                            "symbol": coin,
+                            "bucket": bucket,
+                            "level": info["level"],
+                            "deviation_pct": info["deviation_pct"],
+                        }
+                    )
 
-    print_section("Top Gainers", gainers)
-    print_section("Top Losers", losers)
-    print_section("Top Overlap", overlaps)
+        summary[name] = section
+
+    process_section("Top Gainers", gainers)
+    process_section("Top Losers", losers)
+    process_section("Top Overlap", overlaps)
+
+    with open("leaderboards_summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
 
     save_full_timeseries_csv(losers, history_df, "habitual_losers.csv")
     save_full_timeseries_csv(gainers, history_df, "habitual_gainers.csv")
     save_full_timeseries_csv(overlaps, history_df, "habitual_overlaps.csv")
 
-    conn.close()
+    engine.dispose()
 
 
 if __name__ == "__main__":
