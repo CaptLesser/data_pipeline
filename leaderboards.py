@@ -1,6 +1,4 @@
-"""leaderboards.py
-
-Generate multi-timeframe leaderboards for habitual losers, gainers, and
+"""Generate multi-timeframe leaderboards for habitual losers, gainers, and
 overlap coins based on OHLCVT minute bars stored in MySQL.
 
 Workflow:
@@ -27,14 +25,18 @@ from getpass import getpass
 from typing import Dict, Iterable, List, Tuple
 
 import pandas as pd
+import numpy as np
 import mysql.connector
 
 TABLE_NAME = "ohlcvt"
 
+
 # ------------------------
 # Database connection
 # ------------------------
-def get_db_connection(host: str, user: str, password: str, database: str, port: int = 3306):
+def get_db_connection(
+    host: str, user: str, password: str, database: str, port: int = 3306
+):
     """Create and return a connection to the MySQL database."""
     return mysql.connector.connect(
         host=host,
@@ -43,6 +45,7 @@ def get_db_connection(host: str, user: str, password: str, database: str, port: 
         database=database,
         port=port,
     )
+
 
 # ------------------------
 # Step 1: Filter recent coins
@@ -57,13 +60,18 @@ def get_recent_coins(conn: mysql.connector.MySQLConnection) -> List[str]:
     """
     return pd.read_sql(query, conn)["symbol"].tolist()
 
+
 # ------------------------
 # Step 2: Pull full 30-day data
 # ------------------------
-def get_all_coin_history(conn: mysql.connector.MySQLConnection, symbols: List[str]) -> pd.DataFrame:
+def get_all_coin_history(
+    conn: mysql.connector.MySQLConnection, symbols: List[str]
+) -> pd.DataFrame:
     """Retrieve full 30-day minute OHLCVT history for all symbols in one pull."""
     if not symbols:
-        return pd.DataFrame(columns=["symbol", "timestamp", "open", "high", "low", "close", "volume"])
+        return pd.DataFrame(
+            columns=["symbol", "timestamp", "open", "high", "low", "close", "volume"]
+        )
     placeholders = ",".join(["%s"] * len(symbols))
     query = f"""
     SELECT symbol, timestamp, open, high, low, close, volume
@@ -73,6 +81,7 @@ def get_all_coin_history(conn: mysql.connector.MySQLConnection, symbols: List[st
     ORDER BY symbol ASC, timestamp ASC
     """
     return pd.read_sql(query, conn, params=symbols)
+
 
 # ------------------------
 # Step 3-4: Compute window metrics
@@ -102,7 +111,9 @@ def compute_window_stats(df: pd.DataFrame, window_hours: int) -> pd.DataFrame:
     """
 
     if df.empty:
-        return pd.DataFrame(columns=["window_start", "price_change", "total_volume", "pct_vol_change"])
+        return pd.DataFrame(
+            columns=["window_start", "price_change", "total_volume", "pct_vol_change"]
+        )
 
     df = df.sort_values("timestamp").set_index("timestamp")
 
@@ -121,16 +132,21 @@ def compute_window_stats(df: pd.DataFrame, window_hours: int) -> pd.DataFrame:
     total_volume = resampled["volume"]
     pct_vol_change = total_volume.pct_change() * 100
 
-    stats = pd.DataFrame(
-        {
-            "window_start": resampled.index,
-            "price_change": price_change,
-            "total_volume": total_volume,
-            "pct_vol_change": pct_vol_change,
-        }
-    ).dropna().reset_index(drop=True)
+    stats = (
+        pd.DataFrame(
+            {
+                "window_start": resampled.index,
+                "price_change": price_change,
+                "total_volume": total_volume,
+                "pct_vol_change": pct_vol_change,
+            }
+        )
+        .dropna()
+        .reset_index(drop=True)
+    )
 
     return stats
+
 
 # ------------------------
 # Step 5-6: Ranking & aggregation
@@ -150,33 +166,29 @@ def build_leaderboards(
         if df.empty:
             continue
         for _, group in df.groupby("window_start"):
-            top_losers = (
-                group[group["price_change"] < 0]
-                .nsmallest(top_n, "price_change")["symbol"]
-            )
+            top_losers = group[group["price_change"] < 0].nsmallest(
+                top_n, "price_change"
+            )["symbol"]
             for sym in top_losers:
                 loser_counts[sym] += 1
                 bucket_counts[sym][f"price_{bucket}_loss"] += 1
 
-            top_gainers = (
-                group[group["price_change"] > 0]
-                .nlargest(top_n, "price_change")["symbol"]
-            )
+            top_gainers = group[group["price_change"] > 0].nlargest(
+                top_n, "price_change"
+            )["symbol"]
             for sym in top_gainers:
                 gainer_counts[sym] += 1
                 bucket_counts[sym][f"price_{bucket}_gain"] += 1
 
-            vol_drop = (
-                group[group["pct_vol_change"] < 0]
-                .nsmallest(top_n, "pct_vol_change")["symbol"]
-            )
+            vol_drop = group[group["pct_vol_change"] < 0].nsmallest(
+                top_n, "pct_vol_change"
+            )["symbol"]
             for sym in vol_drop:
                 bucket_counts[sym][f"vol_{bucket}_drop"] += 1
 
-            vol_spike = (
-                group[group["pct_vol_change"] > 0]
-                .nlargest(top_n, "pct_vol_change")["symbol"]
-            )
+            vol_spike = group[group["pct_vol_change"] > 0].nlargest(
+                top_n, "pct_vol_change"
+            )["symbol"]
             for sym in vol_spike:
                 bucket_counts[sym][f"vol_{bucket}_spike"] += 1
 
@@ -190,14 +202,20 @@ def build_leaderboards(
         gain_frac = gainer_counts[coin] / max_g if max_g else 0
         loss_frac = loser_counts[coin] / max_l if max_l else 0
         overlap_scores[coin] = min(gain_frac, loss_frac)
-    overlaps = [c for c, _ in sorted(overlap_scores.items(), key=lambda x: x[1], reverse=True)[:top_n]]
+    overlaps = [
+        c
+        for c, _ in sorted(overlap_scores.items(), key=lambda x: x[1], reverse=True)[
+            :top_n
+        ]
+    ]
     return habitual_losers, habitual_gainers, overlaps, bucket_counts
+
 
 # ------------------------
 # Step 7: Bucket skew detection vs. centroid baseline
 # ------------------------
 def detect_skew(
-    bucket_counts: Dict[str, Counter[str]]
+    bucket_counts: Dict[str, Counter[str]],
 ) -> Tuple[
     Dict[str, Dict[str, Dict[str, float]]],
     Dict[str, float],
@@ -215,6 +233,7 @@ def detect_skew(
         1) Nested mapping of coin -> bucket -> {"level", "deviation_pct"}
            for buckets that deviate from the centroid baseline.
         2) Mapping of coin -> centroid distance.
+    """
 
     if not bucket_counts:
         return {}, {}
@@ -293,20 +312,18 @@ def compute_profile_tags(
 
     tags: Dict[str, List[str]] = {}
     dist_values = list(distances.values())
-    threshold = float(np.mean(dist_values) + np.std(dist_values)) if dist_values else 0.0
+    threshold = (
+        float(np.mean(dist_values) + np.std(dist_values)) if dist_values else 0.0
+    )
 
     for coin, counts in counts_map.items():
         vol_sum = sum(v for k, v in counts.items() if k.startswith("vol_"))
         price_sum = sum(v for k, v in counts.items() if k.startswith("price_"))
         short_sum = sum(
-            v
-            for k, v in counts.items()
-            if k.split("_")[1] in {"6h", "24h"}
+            v for k, v in counts.items() if k.split("_")[1] in {"6h", "24h"}
         )
         long_sum = sum(
-            v
-            for k, v in counts.items()
-            if k.split("_")[1] in {"72h", "168h"}
+            v for k, v in counts.items() if k.split("_")[1] in {"72h", "168h"}
         )
 
         coin_tags: List[str] = []
@@ -322,14 +339,18 @@ def compute_profile_tags(
 
     return tags
 
+
 # ------------------------
 # Step 8: Save CSVs
 # ------------------------
-def save_full_timeseries_csv(symbol_list: Iterable[str], history: pd.DataFrame, filename: str) -> None:
+def save_full_timeseries_csv(
+    symbol_list: Iterable[str], history: pd.DataFrame, filename: str
+) -> None:
     """Save full 30-day timeseries for symbols to a CSV."""
     subset = history[history["symbol"].isin(list(symbol_list))]
     if not subset.empty:
         subset.to_csv(filename, index=False)
+
 
 # ------------------------
 # Step 9: Main routine
@@ -345,7 +366,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--database", required=True, help="Database name")
     parser.add_argument("--port", type=int, default=3306, help="MySQL port")
     parser.add_argument("--password", help="MySQL password (prompt if omitted)")
-    parser.add_argument("--top-n", type=int, default=20, help="Number of coins per leaderboard")
+    parser.add_argument(
+        "--top-n", type=int, default=20, help="Number of coins per leaderboard"
+    )
     return parser.parse_args()
 
 
@@ -354,7 +377,9 @@ def main() -> None:
     if args.password is None:
         args.password = getpass("MySQL password: ")
 
-    conn = get_db_connection(args.host, args.user, args.password, args.database, args.port)
+    conn = get_db_connection(
+        args.host, args.user, args.password, args.database, args.port
+    )
     coins = get_recent_coins(conn)
     print(f"Found {len(coins)} coins with fresh data.")
 
