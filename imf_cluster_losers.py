@@ -4,7 +4,6 @@ import logging
 from datetime import timedelta
 import numpy as np
 import pandas as pd
-from mysql.connector import connect, Error as MySQLError
 from PyEMD import EMD
 from scipy.signal import find_peaks
 from sklearn.mixture import GaussianMixture
@@ -18,30 +17,32 @@ import functools
 from typing import List, Dict, Any
 
 # ─── CONFIG ─────────────────────────────────────────────────────────────
-#TODO - Argparse database connection credentials
 
-def fetch_all_coins():
-    conn = connect(**DB_CONFIG)
-    cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT symbol FROM ohlcvt;")
-    coins = [row[0] for row in cursor.fetchall()]
-    cursor.close()
-    conn.close()
-    return coins
-COINS = fetch_all_coins()
+# Load leaderboard data directly from CSV (no database dependency).
+DF = pd.read_csv('habitual_losers.csv', parse_dates=['timestamp'])
+COINS = DF['symbol'].unique().tolist()
 
-TARGET_DAYS        = [1, 7, 30]
+# Time windows (in days) to analyze: 6h, 12h, 24h, 3d, 7d, 30d
+TARGET_DAYS = [0.25, 0.5, 1, 3, 7, 30]
+WINDOW_LABELS = {
+    0.25: '6h',
+    0.5:  '12h',
+    1:    '24h',
+    3:    '3d',
+    7:    '7d',
+    30:   '30d'
+}
+
 MIN_AMPLITUDE_PCT  = 2.0
-# In the previous version, a fixed number of GMM components was provided per target period.
-# Now, we define a maximum search range. For each asset/time period, the algorithm will try 2 up to this max.
-GMM_MAX_COMPONENTS = {1: 5, 7: 10, 30: 15}
+# Maximum number of GMM components to try for each window
+GMM_MAX_COMPONENTS = {0.25: 5, 0.5: 5, 1: 5, 3: 10, 7: 10, 30: 15}
 # DBSCAN grid search ranges; these can be modified if needed.
 DBSCAN_MIN_SAMPLES_RANGE = range(2, 8)  # trying min_samples between 2 and 7 inclusive.
 DBSCAN_EPS_PERCENTILES   = (10, 90)     # Use 10th to 90th percentile of kth distances for eps grid.
 DBSCAN_EPS_GRID_SIZE     = 10           # Number of eps candidates.
 PLOT_K_DIST              = True
 
-OUTPUT_FILE = 'cluster_summary.json'
+OUTPUT_FILE = 'imf_clusters_losers.json'
 LOG_FILE    = 'pipeline.log'
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────
@@ -74,80 +75,42 @@ def log_enter_exit(func):
 
 # ─── FETCH & PAD SERIES ───────────────────────────────────────────────────
 @log_enter_exit
-def fetch_clean_series(symbol: str, days: int) -> pd.Series:
-    """Fetch closing‐price series at 1‐min cadence."""
-    logger.info("Fetching price for %s over last %d day(s)", symbol, days)
-    try:
-        with connect(**DB_CONFIG) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT MAX(timestamp) FROM ohlcvt WHERE symbol=%s",
-                (symbol,)
-            )
-            latest = cur.fetchone()[0]
-            if latest is None:
-                return pd.Series(dtype=float)
-            start = latest - timedelta(days=days)
-            cur.execute("""
-                SELECT timestamp, close
-                  FROM ohlcvt
-                 WHERE symbol=%s
-                   AND timestamp BETWEEN %s AND %s
-                 ORDER BY timestamp
-            """, (symbol, start, latest))
-            data = cur.fetchall()
-    except MySQLError:
-        logger.exception("DB error in fetch_clean_series")
+def fetch_clean_series(symbol: str, days: float) -> pd.Series:
+    """Fetch closing-price series at 1-min cadence from the CSV dataframe."""
+    logger.info("Fetching price for %s over last %s day(s)", symbol, days)
+    symbol_df = DF[DF['symbol'] == symbol]
+    if symbol_df.empty:
         return pd.Series(dtype=float)
-
-    if not data:
+    symbol_df = symbol_df.sort_values('timestamp')
+    latest = symbol_df['timestamp'].max()
+    start = latest - timedelta(days=days)
+    symbol_df = symbol_df[symbol_df['timestamp'] >= start]
+    if symbol_df.empty:
         return pd.Series(dtype=float)
-
-    df = pd.DataFrame(data, columns=['ts','close'])
-    df['ts'] = pd.to_datetime(df['ts'])
-    df.set_index('ts', inplace=True)
-    full_idx = pd.date_range(df.index.min(), df.index.max(), freq='min')
-    df = df.reindex(full_idx)
-    df['close'] = df['close'].ffill().bfill().astype(float)
-    return df['close']
+    symbol_df = symbol_df.set_index('timestamp')
+    full_idx = pd.date_range(symbol_df.index.min(), symbol_df.index.max(), freq='min')
+    symbol_df = symbol_df.reindex(full_idx)
+    symbol_df['close'] = symbol_df['close'].ffill().bfill().astype(float)
+    return symbol_df['close']
 
 @log_enter_exit
-def fetch_volume_series(symbol: str, days: int) -> pd.Series:
-    """Fetch volume series at 1‐min cadence."""
-    logger.info("Fetching volume for %s over last %d day(s)", symbol, days)
-    try:
-        with connect(**DB_CONFIG) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT MAX(timestamp) FROM ohlcvt WHERE symbol=%s",
-                (symbol,)
-            )
-            latest = cur.fetchone()[0]
-            if latest is None:
-                return pd.Series(dtype=float)
-            start = latest - timedelta(days=days)
-            cur.execute("""
-                SELECT timestamp, volume
-                  FROM ohlcvt
-                 WHERE symbol=%s
-                   AND timestamp BETWEEN %s AND %s
-                 ORDER BY timestamp
-            """, (symbol, start, latest))
-            data = cur.fetchall()
-    except MySQLError:
-        logger.exception("DB error in fetch_volume_series")
+def fetch_volume_series(symbol: str, days: float) -> pd.Series:
+    """Fetch volume series at 1-min cadence from the CSV dataframe."""
+    logger.info("Fetching volume for %s over last %s day(s)", symbol, days)
+    symbol_df = DF[DF['symbol'] == symbol]
+    if symbol_df.empty:
         return pd.Series(dtype=float)
-
-    if not data:
+    symbol_df = symbol_df.sort_values('timestamp')
+    latest = symbol_df['timestamp'].max()
+    start = latest - timedelta(days=days)
+    symbol_df = symbol_df[symbol_df['timestamp'] >= start]
+    if symbol_df.empty:
         return pd.Series(dtype=float)
-
-    df = pd.DataFrame(data, columns=['ts','vol'])
-    df['ts'] = pd.to_datetime(df['ts'])
-    df.set_index('ts', inplace=True)
-    full_idx = pd.date_range(df.index.min(), df.index.max(), freq='min')
-    df = df.reindex(full_idx)
-    df['vol'] = df['vol'].ffill().bfill().astype(float)
-    return df['vol']
+    symbol_df = symbol_df.set_index('timestamp')
+    full_idx = pd.date_range(symbol_df.index.min(), symbol_df.index.max(), freq='min')
+    symbol_df = symbol_df.reindex(full_idx)
+    symbol_df['volume'] = symbol_df['volume'].fillna(0).astype(float)
+    return symbol_df['volume']
 
 # ─── DECOMPOSITION HELPERS ────────────────────────────────────────────────
 def decompose_to_imf_dfs(x: pd.Series, value_col: str) -> List[pd.DataFrame]:
@@ -366,12 +329,13 @@ def cluster_and_summarize(df: pd.DataFrame, days: int) -> dict:
 
 # ─── RUN PER ASSET ───────────────────────────────────────────────────────
 @log_enter_exit
-def run_asset(symbol: str, days: int) -> dict:
+def run_asset(symbol: str, days: float) -> dict:
+    label = WINDOW_LABELS.get(days, f"{days}d")
     # 1) Fetch the original price and volume series.
     price_s = fetch_clean_series(symbol, days)
     vol_s   = fetch_volume_series(symbol, days)
     if price_s.empty or vol_s.empty:
-        logger.warning("Missing series for %s %dd", symbol, days)
+        logger.warning("Missing series for %s %s", symbol, label)
         return {'gmm': [], 'dbscan': []}
 
     # 2) Decompose into IMF dataframes for price and volume separately.
@@ -383,7 +347,7 @@ def run_asset(symbol: str, days: int) -> dict:
     volume_cycles_list = [c for df in volume_imfs for c in extract_cycles(df, 'imf_volume', ref_series=vol_s)]
     
     if not price_cycles_list or not volume_cycles_list:
-        logger.warning("No price or volume cycles for %s %dd", symbol, days)
+        logger.warning("No price or volume cycles for %s %s", symbol, label)
         return {'gmm': [], 'dbscan': []}
 
     price_cycles  = pd.DataFrame(price_cycles_list)
@@ -391,7 +355,7 @@ def run_asset(symbol: str, days: int) -> dict:
 
     volume_cycles = volume_cycles[volume_cycles['amplitude_pct'] != 0]
     if volume_cycles.empty:
-        logger.warning("No volume cycles (after dropping flat cycles) for %s %dd", symbol, days)
+        logger.warning("No volume cycles (after dropping flat cycles) for %s %s", symbol, label)
         return {'gmm': [], 'dbscan': []}
 
     # 5) Fuse cycles using the price cycles as anchors.
@@ -423,15 +387,15 @@ def run_asset(symbol: str, days: int) -> dict:
             'total_volume':  float(vol_sum)
         })
 
-    logger.info("Asset %s over %dd: minute bars: price=%d, volume=%d", 
-                symbol, days, len(price_s), len(vol_s))
-    logger.info("Asset %s over %dd: extracted %d price cycles and %d volume cycles", 
-                symbol, days, len(price_cycles), len(volume_cycles))
-    logger.info("Asset %s over %dd: created %d fused cycle records", 
-                symbol, days, len(fused_records))
+    logger.info("Asset %s over %s: minute bars: price=%d, volume=%d",
+                symbol, label, len(price_s), len(vol_s))
+    logger.info("Asset %s over %s: extracted %d price cycles and %d volume cycles",
+                symbol, label, len(price_cycles), len(volume_cycles))
+    logger.info("Asset %s over %s: created %d fused cycle records",
+                symbol, label, len(fused_records))
 
     if not fused_records:
-        logger.warning("No fused cycles for %s %dd after overlapping join", symbol, days)
+        logger.warning("No fused cycles for %s %s after overlapping join", symbol, label)
         return {'gmm': [], 'dbscan': []}
 
     fused = pd.DataFrame(fused_records)
@@ -444,7 +408,7 @@ def main():
     for coin in COINS:
         summary[coin] = {}
         for days in TARGET_DAYS:
-            key = f"{days}d"
+            key = WINDOW_LABELS.get(days, f"{days}d")
             logger.info("Running asset for coin %s with time period %s", coin, key)
             summary[coin][key] = run_asset(coin, days)
     with open(OUTPUT_FILE, 'w') as fp:
