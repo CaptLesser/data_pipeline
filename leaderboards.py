@@ -355,27 +355,40 @@ def save_full_timeseries_csv(
 # ------------------------
 # Step 9: Main routine
 # ------------------------
+
+
+
+
 def parse_args() -> argparse.Namespace:
     """Collect database connection and leaderboard options from the CLI."""
 
     parser = argparse.ArgumentParser(
-        description="Generate leaderboards from OHLCVT data"
+        description="Generate leaderboards from OHLCVT data",
     )
-    parser.add_argument("--host", required=True, help="MySQL host")
-    parser.add_argument("--user", required=True, help="MySQL user")
-    parser.add_argument("--database", required=True, help="Database name")
+    parser.add_argument("--host", help="MySQL host")
+    parser.add_argument("--user", help="MySQL user")
+    parser.add_argument("--database", help="Database name")
     parser.add_argument("--port", type=int, default=3306, help="MySQL port")
     parser.add_argument("--password", help="MySQL password (prompt if omitted)")
     parser.add_argument(
-        "--top-n", type=int, default=20, help="Number of coins per leaderboard"
+        "--top-n", type=int, default=20, help="Number of coins per leaderboard",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.host is None:
+        args.host = input("MySQL host: ")
+    if args.user is None:
+        args.user = input("MySQL user: ")
+    if args.database is None:
+        args.database = input("Database name: ")
+    if args.password is None:
+        args.password = getpass("MySQL password: ")
+
+    return args
 
 
 def main() -> None:
     args = parse_args()
-    if args.password is None:
-        args.password = getpass("MySQL password: ")
 
     conn = get_db_connection(
         args.host, args.user, args.password, args.database, args.port
