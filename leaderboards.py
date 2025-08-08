@@ -27,7 +27,6 @@ from getpass import getpass
 from typing import Dict, Iterable, List, Tuple
 
 import pandas as pd
-import numpy as np
 import mysql.connector
 
 TABLE_NAME = "ohlcvt"
@@ -216,7 +215,6 @@ def detect_skew(
         1) Nested mapping of coin -> bucket -> {"level", "deviation_pct"}
            for buckets that deviate from the centroid baseline.
         2) Mapping of coin -> centroid distance.
-    """
 
     if not bucket_counts:
         return {}, {}
