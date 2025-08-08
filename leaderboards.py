@@ -13,8 +13,8 @@ Workflow:
    - Volume % change vs. previous disjoint window
 5. Rank coins for each window & metric using top-N appearances
 6. Aggregate counts over 30 days to find habitual losers/gainers/overlaps
-7. Analyze bucket tallies against a global baseline to detect per-bucket
-   skew for top coins
+7. Analyze bucket tallies to compute centroid distances, profile tags, and
+   per-bucket deviations for top coins
 8. Output CSVs containing full time series for qualifying coins
 9. Print summary lists and skew reports to the terminal
 
@@ -97,7 +97,8 @@ def compute_window_stats(df: pd.DataFrame, window_hours: int) -> pd.DataFrame:
     -----
     Price change is calculated as the percent change between the current
     window's close and the previous window's close. Volume change compares
-    total volume against the previous disjoint window.
+    total volume against the previous disjoint window. All resample windows
+    align to UTC boundaries using ``origin='epoch'``.
     """
 
     if df.empty:
@@ -110,7 +111,7 @@ def compute_window_stats(df: pd.DataFrame, window_hours: int) -> pd.DataFrame:
             f"{window_hours}H",
             label="left",
             closed="left",
-            origin=df.index[0],
+            origin="epoch",
         )
         .agg({"close": "last", "volume": "sum"})
         .dropna()
@@ -181,14 +182,27 @@ def build_leaderboards(
 
     habitual_losers = [c for c, _ in loser_counts.most_common(top_n)]
     habitual_gainers = [c for c, _ in gainer_counts.most_common(top_n)]
-    overlaps = list(set(habitual_losers) & set(habitual_gainers))
+    max_g = max(gainer_counts.values(), default=0)
+    max_l = max(loser_counts.values(), default=0)
+    overlap_scores = {}
+    all_coins = set(gainer_counts) | set(loser_counts)
+    for coin in all_coins:
+        gain_frac = gainer_counts[coin] / max_g if max_g else 0
+        loss_frac = loser_counts[coin] / max_l if max_l else 0
+        overlap_scores[coin] = min(gain_frac, loss_frac)
+    overlaps = [c for c, _ in sorted(overlap_scores.items(), key=lambda x: x[1], reverse=True)[:top_n]]
     return habitual_losers, habitual_gainers, overlaps, bucket_counts
 
 # ------------------------
-# Step 7: Bucket skew detection vs. global baseline
+# Step 7: Bucket skew detection vs. centroid baseline
 # ------------------------
-def detect_skew(bucket_counts: Dict[str, Counter[str]]) -> Dict[str, Dict[str, Dict[str, float]]]:
-    """Measure per-bucket deviation from the global average.
+def detect_skew(
+    bucket_counts: Dict[str, Counter[str]]
+) -> Tuple[
+    Dict[str, Dict[str, Dict[str, float]]],
+    Dict[str, float],
+]:
+    """Measure per-bucket deviation from a centroid of top coins.
 
     Parameters
     ----------
@@ -197,54 +211,116 @@ def detect_skew(bucket_counts: Dict[str, Counter[str]]) -> Dict[str, Dict[str, D
 
     Returns
     -------
-    Dict[str, Dict[str, Dict[str, float]]]
-        Nested mapping of coin -> bucket -> {"level", "deviation_pct"} for
-        buckets that deviate from the global baseline by at least 10%.
-    """
+    Tuple
+        1) Nested mapping of coin -> bucket -> {"level", "deviation_pct"}
+           for buckets that deviate from the centroid baseline.
+        2) Mapping of coin -> centroid distance.
 
     if not bucket_counts:
-        return {}
+        return {}, {}
 
-    global_totals: Counter[str] = Counter()
-    for counts in bucket_counts.values():
-        global_totals.update(counts)
+    all_buckets = sorted({b for counts in bucket_counts.values() for b in counts})
+    if not all_buckets:
+        return {}, {}
 
-    total_global = sum(global_totals.values())
-    if total_global == 0:
-        return {}
+    vectors: List[np.ndarray] = []
+    coins: List[str] = []
+    for coin, counts in bucket_counts.items():
+        vec = np.array([counts.get(b, 0) for b in all_buckets], dtype=float)
+        total = vec.sum()
+        if total == 0:
+            continue
+        vectors.append(vec / total)
+        coins.append(coin)
 
-    global_share = {
-        bucket: count / total_global for bucket, count in global_totals.items()
-    }
+    if not vectors:
+        return {}, {}
+
+    X = np.vstack(vectors)
+    centroid = X.mean(axis=0)
+
+    coin_devs: Dict[str, Dict[str, float]] = {}
+    all_abs_devs: List[float] = []
+    for coin, vec in zip(coins, X):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            dev_vec = np.where(centroid != 0, (vec - centroid) / centroid * 100, 0)
+        coin_devs[coin] = dict(zip(all_buckets, dev_vec))
+        all_abs_devs.extend([abs(d) for d in dev_vec])
+
+    abs_array = np.array(all_abs_devs)
+    heavy_cut = float(np.percentile(abs_array, 95))
+    moderate_cut = float(np.percentile(abs_array, 75))
+    slight_cut = float(np.percentile(abs_array, 50))
+
+    distances_arr = np.linalg.norm(X - centroid, axis=1)
 
     result: Dict[str, Dict[str, Dict[str, float]]] = {}
-    for coin, counts in bucket_counts.items():
-        coin_total = sum(counts.values())
-        if coin_total == 0:
-            continue
-        coin_share = {bucket: counts.get(bucket, 0) / coin_total for bucket in global_share}
-
-        deviations: Dict[str, Dict[str, float]] = {}
-        for bucket, baseline in global_share.items():
-            share = coin_share.get(bucket, 0)
-            if baseline == 0:
-                continue
-            deviation_pct = ((share - baseline) / baseline) * 100
-            abs_dev = abs(deviation_pct)
-            if abs_dev >= 60:
+    distances: Dict[str, float] = {}
+    for coin, devs, dist in zip(coins, [coin_devs[c] for c in coins], distances_arr):
+        distances[coin] = float(dist)
+        bucket_info: Dict[str, Dict[str, float]] = {}
+        for bucket, dev in devs.items():
+            abs_dev = abs(dev)
+            if abs_dev >= heavy_cut:
                 level = "heavy"
-            elif abs_dev >= 30:
+            elif abs_dev >= moderate_cut:
                 level = "moderate"
-            elif abs_dev >= 10:
+            elif abs_dev >= slight_cut:
                 level = "slight"
             else:
                 continue
-            deviations[bucket] = {"level": level, "deviation_pct": deviation_pct}
+            bucket_info[bucket] = {"level": level, "deviation_pct": float(dev)}
+        if bucket_info:
+            result[coin] = bucket_info
 
-        if deviations:
-            result[coin] = deviations
+    return result, distances
 
-    return result
+
+def compute_profile_tags(
+    counts_map: Dict[str, Counter[str]],
+    distances: Dict[str, float],
+    vol_price_ratio: float = 1.5,
+    short_long_ratio: float = 1.5,
+) -> Dict[str, List[str]]:
+    """Derive profile tags for each coin based on bucket counts and distance.
+
+    Tags include:
+    - ``Vol Mover``: volume buckets dominate price buckets
+    - ``Short-Term``: short windows (6h/24h) dominate long ones (72h/168h)
+    - ``Long-Term``: long windows dominate short ones
+    - ``Balanced``: centroid distance is within one standard deviation of the mean
+    """
+
+    tags: Dict[str, List[str]] = {}
+    dist_values = list(distances.values())
+    threshold = float(np.mean(dist_values) + np.std(dist_values)) if dist_values else 0.0
+
+    for coin, counts in counts_map.items():
+        vol_sum = sum(v for k, v in counts.items() if k.startswith("vol_"))
+        price_sum = sum(v for k, v in counts.items() if k.startswith("price_"))
+        short_sum = sum(
+            v
+            for k, v in counts.items()
+            if k.split("_")[1] in {"6h", "24h"}
+        )
+        long_sum = sum(
+            v
+            for k, v in counts.items()
+            if k.split("_")[1] in {"72h", "168h"}
+        )
+
+        coin_tags: List[str] = []
+        if vol_sum > vol_price_ratio * price_sum:
+            coin_tags.append("Vol Mover")
+        if short_sum > short_long_ratio * long_sum:
+            coin_tags.append("Short-Term")
+        elif long_sum > short_long_ratio * short_sum:
+            coin_tags.append("Long-Term")
+        if distances.get(coin, float("inf")) < threshold:
+            coin_tags.append("Balanced")
+        tags[coin] = coin_tags
+
+    return tags
 
 # ------------------------
 # Step 8: Save CSVs
@@ -300,25 +376,40 @@ def main() -> None:
         aggregated_stats, top_n=args.top_n
     )
 
-    top_coins = set(losers) | set(gainers) | set(overlaps)
-    filtered_counts = {c: bucket_counts[c] for c in top_coins if c in bucket_counts}
-    skew_info = detect_skew(filtered_counts)
+    latest_24h = (
+        aggregated_stats[24]
+        .sort_values("window_start")
+        .groupby("symbol")
+        .tail(1)
+        .set_index("symbol")[["price_change", "pct_vol_change"]]
+        .to_dict("index")
+    )
 
-    print("\nHabitual Losers:", losers)
-    print("\nHabitual Gainers:", gainers)
-    print("\nOverlaps:", overlaps)
+    def print_section(name: str, coins: List[str]) -> None:
+        counts_map = {c: bucket_counts[c] for c in coins if c in bucket_counts}
+        skew_info, distances = detect_skew(counts_map)
+        tags = compute_profile_tags(counts_map, distances)
 
-    print("\nSkew Report (deviation from global baseline):")
-    print(f"{'Coin':<10}{'Bucket':<20}{'Level':<10}{'Deviation%':>12}")
-    for coin in sorted(top_coins):
-        buckets = skew_info.get(coin)
-        if not buckets:
-            print(f"{coin:<10}{'None':<20}{'--':<10}{'--':>12}")
-            continue
-        for bucket, info in buckets.items():
-            print(
-                f"{coin:<10}{bucket:<20}{info['level']:<10}{info['deviation_pct']:+12.2f}"
-            )
+        print(f"\n{name}:")
+        for c in coins:
+            metrics = latest_24h.get(c, {})
+            price = metrics.get("price_change", float("nan"))
+            vol = metrics.get("pct_vol_change", float("nan"))
+            tag_str = ", ".join(tags.get(c, [])) or "None"
+            print(f"[{c}] PriceΔ: {price:+.2f}% VolΔ: {vol:+.2f}% Skew: {tag_str}")
+
+        if skew_info:
+            print(f"\nSkew Details ({name}):")
+            print(f"{'Coin':<10}{'Bucket':<20}{'Level':<10}{'Deviation%':>12}")
+            for coin in coins:
+                for bucket, info in skew_info.get(coin, {}).items():
+                    print(
+                        f"{coin:<10}{bucket:<20}{info['level']:<10}{info['deviation_pct']:+12.2f}"
+                    )
+
+    print_section("Top Gainers", gainers)
+    print_section("Top Losers", losers)
+    print_section("Top Overlap", overlaps)
 
     save_full_timeseries_csv(losers, history_df, "habitual_losers.csv")
     save_full_timeseries_csv(gainers, history_df, "habitual_gainers.csv")
