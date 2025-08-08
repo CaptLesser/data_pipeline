@@ -13,9 +13,10 @@ Workflow:
    - Volume % change vs. previous disjoint window
 5. Rank coins for each window & metric using top-N appearances
 6. Aggregate counts over 30 days to find habitual losers/gainers/overlaps
-7. Perform clustering (HDBSCAN) to detect disproportional "bucket skew"
+7. Analyze bucket tallies against a global baseline to detect per-bucket
+   skew for top coins
 8. Output CSVs containing full time series for qualifying coins
-9. Print summary lists to terminal
+9. Print summary lists and skew reports to the terminal
 
 Note: Ensure the MySQL table is indexed on (symbol, timestamp) for performance.
 """
@@ -26,9 +27,7 @@ from getpass import getpass
 from typing import Dict, Iterable, List, Tuple
 
 import pandas as pd
-import numpy as np
 import mysql.connector
-import hdbscan  # For skew detection
 
 TABLE_NAME = "ohlcvt"
 
@@ -93,6 +92,12 @@ def compute_window_stats(df: pd.DataFrame, window_hours: int) -> pd.DataFrame:
     DataFrame
         Columns: window_start (timestamp at start of window), price_change,
         total_volume, pct_vol_change.
+
+    Notes
+    -----
+    Price change is calculated as the percent change between the current
+    window's close and the previous window's close. Volume change compares
+    total volume against the previous disjoint window.
     """
 
     if df.empty:
@@ -107,11 +112,11 @@ def compute_window_stats(df: pd.DataFrame, window_hours: int) -> pd.DataFrame:
             closed="left",
             origin=df.index[0],
         )
-        .agg({"open": "first", "close": "last", "volume": "sum"})
+        .agg({"close": "last", "volume": "sum"})
         .dropna()
     )
 
-    price_change = ((resampled["close"] - resampled["open"]) / resampled["open"]) * 100
+    price_change = resampled["close"].pct_change() * 100
     total_volume = resampled["volume"]
     pct_vol_change = total_volume.pct_change() * 100
 
@@ -180,69 +185,64 @@ def build_leaderboards(
     return habitual_losers, habitual_gainers, overlaps, bucket_counts
 
 # ------------------------
-# Step 7: Bucket skew detection with HDBSCAN
+# Step 7: Bucket skew detection vs. global baseline
 # ------------------------
-def detect_skew(bucket_counts: Dict[str, Counter[str]]) -> Dict[str, Dict[str, float]]:
-    """Cluster bucket proportion vectors and flag disproportionate skews."""
+def detect_skew(bucket_counts: Dict[str, Counter[str]]) -> Dict[str, Dict[str, Dict[str, float]]]:
+    """Measure per-bucket deviation from the global average.
+
+    Parameters
+    ----------
+    bucket_counts : Dict[str, Counter[str]]
+        Mapping of coin -> bucket tally counts.
+
+    Returns
+    -------
+    Dict[str, Dict[str, Dict[str, float]]]
+        Nested mapping of coin -> bucket -> {"level", "deviation_pct"} for
+        buckets that deviate from the global baseline by at least 10%.
+    """
+
     if not bucket_counts:
         return {}
 
-    buckets = sorted({b for counts in bucket_counts.values() for b in counts})
+    global_totals: Counter[str] = Counter()
+    for counts in bucket_counts.values():
+        global_totals.update(counts)
 
-    data: List[List[float]] = []
-    coins: List[str] = []
+    total_global = sum(global_totals.values())
+    if total_global == 0:
+        return {}
+
+    global_share = {
+        bucket: count / total_global for bucket, count in global_totals.items()
+    }
+
+    result: Dict[str, Dict[str, Dict[str, float]]] = {}
     for coin, counts in bucket_counts.items():
-        total = sum(counts.values())
-        vec = [counts.get(b, 0) / total if total else 0 for b in buckets]
-        data.append(vec)
-        coins.append(coin)
+        coin_total = sum(counts.values())
+        if coin_total == 0:
+            continue
+        coin_share = {bucket: counts.get(bucket, 0) / coin_total for bucket in global_share}
 
-    X = np.array(data)
+        deviations: Dict[str, Dict[str, float]] = {}
+        for bucket, baseline in global_share.items():
+            share = coin_share.get(bucket, 0)
+            if baseline == 0:
+                continue
+            deviation_pct = ((share - baseline) / baseline) * 100
+            abs_dev = abs(deviation_pct)
+            if abs_dev >= 60:
+                level = "heavy"
+            elif abs_dev >= 30:
+                level = "moderate"
+            elif abs_dev >= 10:
+                level = "slight"
+            else:
+                continue
+            deviations[bucket] = {"level": level, "deviation_pct": deviation_pct}
 
-    # For very small samples, simply report dominant buckets without skewing.
-    if len(X) < 2:
-        result: Dict[str, Dict[str, float]] = {}
-        for coin, vec in zip(coins, X):
-            dominant_idx = int(np.argmax(vec)) if len(vec) else 0
-            dominant_bucket = buckets[dominant_idx] if buckets else ""
-            result[coin] = {
-                "skewed": 0,
-                "cluster": 0,
-                "dominant_bucket": dominant_bucket,
-                "skew_strength": float(vec[dominant_idx]) if len(vec) else 0.0,
-            }
-        return result
-
-    clusterer = hdbscan.HDBSCAN(min_cluster_size=2)
-    labels = clusterer.fit_predict(X)
-
-    # Baseline medians for each bucket globally and within each cluster
-    global_median = np.median(X, axis=0)
-    cluster_medians: Dict[int, np.ndarray] = {}
-    for label in set(labels):
-        cluster_mask = labels == label
-        cluster_medians[int(label)] = np.median(X[cluster_mask], axis=0)
-
-    result: Dict[str, Dict[str, float]] = {}
-    for idx, (coin, vec) in enumerate(zip(coins, X)):
-        label = int(labels[idx])
-        dominant_idx = int(np.argmax(vec)) if len(vec) else 0
-        dominant_bucket = buckets[dominant_idx] if buckets else ""
-        dominant_share = float(vec[dominant_idx]) if len(vec) else 0.0
-
-        baseline = (
-            cluster_medians[label][dominant_idx]
-            if label != -1
-            else global_median[dominant_idx]
-        )
-        skewed = int(dominant_share > baseline + 0.1)
-
-        result[coin] = {
-            "skewed": skewed,
-            "cluster": label,
-            "dominant_bucket": dominant_bucket,
-            "skew_strength": dominant_share,
-        }
+        if deviations:
+            result[coin] = deviations
 
     return result
 
@@ -299,12 +299,26 @@ def main() -> None:
     losers, gainers, overlaps, bucket_counts = build_leaderboards(
         aggregated_stats, top_n=args.top_n
     )
-    skew_info = detect_skew(bucket_counts)
+
+    top_coins = set(losers) | set(gainers) | set(overlaps)
+    filtered_counts = {c: bucket_counts[c] for c in top_coins if c in bucket_counts}
+    skew_info = detect_skew(filtered_counts)
 
     print("\nHabitual Losers:", losers)
     print("\nHabitual Gainers:", gainers)
     print("\nOverlaps:", overlaps)
-    print("\nSkew Analysis:", skew_info)
+
+    print("\nSkew Report (deviation from global baseline):")
+    print(f"{'Coin':<10}{'Bucket':<20}{'Level':<10}{'Deviation%':>12}")
+    for coin in sorted(top_coins):
+        buckets = skew_info.get(coin)
+        if not buckets:
+            print(f"{coin:<10}{'None':<20}{'--':<10}{'--':>12}")
+            continue
+        for bucket, info in buckets.items():
+            print(
+                f"{coin:<10}{bucket:<20}{info['level']:<10}{info['deviation_pct']:+12.2f}"
+            )
 
     save_full_timeseries_csv(losers, history_df, "habitual_losers.csv")
     save_full_timeseries_csv(gainers, history_df, "habitual_gainers.csv")
