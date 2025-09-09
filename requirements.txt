@@ -4,3 +4,7 @@ pytest
 mysql-connector-python
 hdbscan
 sqlalchemy
+PyEMD
+scikit-learn
+scipy
+kneed
