@@ -98,7 +98,11 @@ export LOSERS_CSV=kraken_top_losers.csv
 export HISTORY_OUTPUT_CSV=losers_30day_history.csv
 export OHLCVT_TABLE=ohlcvt
 
-python fetch_loser_history.py
+python fetch_loser_history.py [--host ... --user ... --database ... --port 3306 --password ...] \
+  [--input-csv kraken_top_losers.csv] [--output-csv losers_30day_history.csv]
+
+Notes:
+- You can provide DB credentials via flags as above, via environment variables, or omit them to be prompted interactively.
 ```
 
 ### 4b) Fetch 30-Day History for Gainers from MySQL
@@ -115,7 +119,11 @@ export GAINERS_CSV=habitual_gainers.csv
 export GAINERS_HISTORY_OUTPUT_CSV=gainers_30day_history.csv
 export OHLCVT_TABLE=ohlcvt
 
-python fetch_gainers_history.py
+python fetch_gainers_history.py [--host ... --user ... --database ... --port 3306 --password ...] \
+  [--input-csv habitual_gainers.csv] [--output-csv gainers_30day_history.csv]
+
+Notes:
+- Credentials accepted via CLI flags/env; any missing values will be prompted.
 ```
 
 ### 4c) Fetch 30-Day History for Overlaps from MySQL
@@ -132,7 +140,11 @@ export OVERLAPS_CSV=habitual_overlaps.csv
 export OVERLAPS_HISTORY_OUTPUT_CSV=overlaps_30day_history.csv
 export OHLCVT_TABLE=ohlcvt
 
-python fetch_overlaps_history.py
+python fetch_overlaps_history.py [--host ... --user ... --database ... --port 3306 --password ...] \
+  [--input-csv habitual_overlaps.csv] [--output-csv overlaps_30day_history.csv]
+
+Notes:
+- Credentials accepted via CLI flags/env; any missing values will be prompted.
 ```
 
 ### 5) Daily Metrics Pipeline (WIP)
