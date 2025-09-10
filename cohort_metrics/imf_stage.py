@@ -22,6 +22,7 @@ except Exception:  # pragma: no cover
     hdbscan = None
 
 from .db import get_db_engine, fetch_history_months
+import concurrent.futures as futures
 
 
 EPS = 1e-9
@@ -177,7 +178,8 @@ def _hilbert_phase(imf: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]
     amp = np.abs(analytic)
     phase = np.unwrap(np.angle(analytic))
     dphi = np.diff(phase)
-    inst_period = (2.0 * np.pi) / np.clip(dphi, EPS, None)
+    # Use absolute phase increment to avoid negative diffs biasing periods
+    inst_period = (2.0 * np.pi) / np.clip(np.abs(dphi), EPS, None)
     # pad to match length
     inst_period = np.r_[inst_period, inst_period[-1]]
     return amp, phase, inst_period
@@ -224,21 +226,21 @@ def _analyze_imf(
     series_orig: np.ndarray,
     min_period_bars: int,
     max_period_frac: float,
-) -> Optional[Dict[str, float]]:
+) -> Tuple[Optional[Dict[str, float]], Optional[Tuple[np.ndarray, int, int]]]:
     # Smooth IMF
     imf = y_transformed
     amp, phase, inst_period = _hilbert_phase(imf)
     median_period = float(np.nanmedian(inst_period[np.isfinite(inst_period)]))
     if not math.isfinite(median_period) or median_period < min_period_bars:
-        return None
+        return None, None
     # period sanity
     if median_period > max_period_frac * len(imf):
-        return None
+        return None, None
     # Edge guard
     guard = max(1, int(round(0.25 * median_period)))
     valid_slice = slice(guard, len(imf) - guard)
     if valid_slice.stop - valid_slice.start < min_period_bars * 2:
-        return None
+        return None, None
     median_period_guarded = float(np.nanmedian(inst_period[valid_slice]))
     phase_var = _circular_variance(phase[valid_slice])
     # Extrema brackets
@@ -256,17 +258,19 @@ def _analyze_imf(
     cycles_count = len(good_brackets)
     pct_cycles_ge_2pct = float(len(kept_depths) / cycles_count * 100.0) if cycles_count > 0 else float("nan")
     if len(kept_depths) == 0:
-        return None
+        return None, None
     amp_pct = float(np.median(kept_depths))
     energy = float(np.var(imf))
-    return {
+    info = {
         "period_bars": median_period_guarded,
         "amp_pct": amp_pct,
         "phase_var": phase_var,
-        "cycles_count": float(cycles_count),
+        "cycles_count": int(cycles_count),
         "pct_cycles_ge_2pct": pct_cycles_ge_2pct,
         "energy": energy,
     }
+    # Provide amplitude envelope and guard for fusion corr computation
+    return info, (amp, valid_slice.start, valid_slice.stop)
 
 
 def _compute_imf_features_for_series(
@@ -279,22 +283,28 @@ def _compute_imf_features_for_series(
     seed: int,
     max_seconds_per_asset: Optional[float],
     persist_path: Optional[str] = None,
-) -> Tuple[List[Dict[str, float]], str]:
+) -> Tuple[List[Dict[str, float]], str, Dict[int, Tuple[np.ndarray, int, int]]]:
     imfs, residue, status, used_trials = _ceemdan(y, trials=trials, seed=seed, max_seconds=max_seconds_per_asset)
+    # If time budget exceeded and we used high trials, rerun with reduced trials for faster output
+    if max_seconds_per_asset is not None and status == "time_budget_reduced" and trials > 20:
+        imfs, residue, status2, used_trials = _ceemdan(y, trials=20, seed=seed, max_seconds=None)
+        status = status2 if status2 != "ok" else "time_budget_reduced"
     n = len(y)
     feats: List[Dict[str, float]] = []
+    amp_envs: Dict[int, Tuple[np.ndarray, int, int]] = {}
     if imfs is None or imfs.size == 0:
-        return feats, ("decomp_error" if status == "ok" else status)
+        return feats, ("decomp_error" if status == "ok" else status), amp_envs
     # Energy shares per IMF (exclude residue)
     energies = np.var(imfs, axis=1)
     energy_total = float(np.sum(energies)) + EPS
     for k in range(imfs.shape[0]):
-        info = _analyze_imf(series_name, imfs[k], series_orig, min_period_bars, max_period_frac)
-        if info is None:
+        info, amp_meta = _analyze_imf(series_name, imfs[k], series_orig, min_period_bars, max_period_frac)
+        if info is None or amp_meta is None:
             continue
         info["energy_share"] = float(energies[k] / energy_total)
-        info["imf_id"] = float(k)
+        info["imf_id"] = int(k)
         feats.append(info)
+        amp_envs[int(k)] = amp_meta
     if persist_path is not None:
         _ensure_dir(os.path.dirname(persist_path))
         np.savez_compressed(
@@ -304,12 +314,17 @@ def _compute_imf_features_for_series(
             imf_variances=energies,
         )
     if len(feats) == 0:
-        return feats, "no_kept_imfs" if status == "ok" else status
-    return feats, status
+        return feats, ("no_kept_imfs" if status == "ok" else status), amp_envs
+    return feats, status, amp_envs
 
 
-def _pair_price_volume(price_feats: List[Dict[str, float]], vol_feats: List[Dict[str, float]]) -> Dict[int, Dict[str, float]]:
-    # Pair each price IMF to closest-period volume IMF; tie-break by amp corr (placeholder: use period proximity only)
+def _pair_price_volume(
+    price_feats: List[Dict[str, float]],
+    vol_feats: List[Dict[str, float]],
+    price_amp_envs: Dict[int, Tuple[np.ndarray, int, int]],
+    vol_amp_envs: Dict[int, Tuple[np.ndarray, int, int]],
+) -> Dict[int, Dict[str, float]]:
+    # Pair each price IMF to closest-period volume IMF; tie-break using amplitude envelope corr
     if not price_feats or not vol_feats:
         return {}
     out: Dict[int, Dict[str, float]] = {}
@@ -317,13 +332,36 @@ def _pair_price_volume(price_feats: List[Dict[str, float]], vol_feats: List[Dict
     for pf in price_feats:
         pid = int(pf["imf_id"])
         pper = float(pf["period_bars"])
-        idx = int(np.argmin(np.abs(vol_periods - pper)))
-        vf = vol_feats[idx]
+        # initial best by period distance
+        best_idx = int(np.argmin(np.abs(vol_periods - pper)))
+        best_corr = -np.inf
+        # evaluate corr for candidates within small band around best (e.g., top 3 closest periods)
+        order = np.argsort(np.abs(vol_periods - pper))[:3]
+        for idx in order:
+            vid = int(vol_feats[idx]["imf_id"])
+            pa, ps, pe = price_amp_envs.get(pid, (None, None, None))
+            va, vs, ve = vol_amp_envs.get(vid, (None, None, None))
+            corr = float("nan")
+            if isinstance(pa, np.ndarray) and isinstance(va, np.ndarray):
+                s = max(int(ps), int(vs))
+                e = min(int(pe), int(ve))
+                if e - s >= max(10, 2 * 3):
+                    a = pa[s:e]
+                    b = va[s:e]
+                    if a.size == b.size and a.size > 1 and np.isfinite(a).all() and np.isfinite(b).all():
+                        try:
+                            corr = float(np.corrcoef(a, b)[0, 1])
+                        except Exception:
+                            corr = float("nan")
+            if math.isfinite(corr) and corr > best_corr:
+                best_corr = corr
+                best_idx = int(idx)
+        vf = vol_feats[best_idx]
+        vid = int(vf["imf_id"])
         out[pid] = {
             "vol_period_ratio": float((pper + EPS) / (vf["period_bars"] + EPS)),
             "vol_energy_share": float(vf.get("energy_share", float("nan"))),
-            # amp corr left as NaN placeholder; could compute via Hilbert envelopes with original series
-            "vol_amp_corr": float("nan"),
+            "vol_amp_corr": best_corr if math.isfinite(best_corr) else float("nan"),
         }
     return out
 
@@ -355,7 +393,8 @@ def _global_cluster(labels_prefix: str, X: np.ndarray, seed: int = 1337) -> Tupl
                 if labels[i] == -1:
                     labels[i] = next_id
                     next_id += 1
-    if model is None or (hasattr(model, "labels_") and len(set([l for l in labels if l < 90000])) == 0):
+    real_mask = labels < 90000 if labels is not None else np.array([], dtype=bool)
+    if model is None or (labels is not None and real_mask.sum() == 0):
         # Fallback KMeans
         best = None
         best_k = None
@@ -402,6 +441,101 @@ def _label_clusters(series: str, labels: np.ndarray, periods: np.ndarray) -> Tup
     return out, mapping
 
 
+def _stub_row(symbol: str, asof: pd.Timestamp, series: str, status: str) -> Dict[str, object]:
+    return {
+        "symbol": symbol,
+        "asof": asof.to_pydatetime(),
+        "series": series,
+        "imf_id": int(-1),
+        "period_days": float("nan"),
+        "amp_pct": float("nan"),
+        "energy_share": float("nan"),
+        "cycles_count": int(0),
+        "pct_cycles_ge_2pct": float("nan"),
+        "phase_var": float("nan"),
+        "vol_amp_corr": float("nan") if series == "price" else None,
+        "vol_period_ratio": float("nan") if series == "price" else None,
+        "vol_energy_share": float("nan") if series == "price" else None,
+        "status": status,
+    }
+
+
+def _process_symbol(sym: str, g: pd.DataFrame, asof: pd.Timestamp, win_start: pd.Timestamp, args) -> List[Dict[str, object]]:
+    g = g.dropna(subset=["timestamp"]).copy()
+    g = _reindex_1min(g, asof, win_start)
+    close = g["close"].astype(float)
+    volume = g["volume"].astype(float)
+    y_price, y_vol = _transform_series(close, volume, detrend=bool(args.detrend), winsorize=bool(args.winsorize))
+    rows: List[Dict[str, object]] = []
+    min_period_bars = 3
+    max_period_frac = 2.0 / 3.0
+    # Persist paths
+    persist_paths = {}
+    if args.persist_imfs:
+        dt_dir = os.path.join(args.out, f"dt={asof.date().isoformat()}")
+        persist_paths[(sym, "price")] = os.path.join(dt_dir, "imfs", f"{sym}_price.npz")
+        persist_paths[(sym, "volume")] = os.path.join(dt_dir, "imfs", f"{sym}_volume.npz")
+    # Compute series
+    price_feats, status_price, price_amp_envs = _compute_imf_features_for_series(
+        "price", y_price, close.to_numpy(dtype=float), min_period_bars, max_period_frac,
+        trials=100, seed=1337, max_seconds_per_asset=args.max_seconds_per_asset,
+        persist_path=persist_paths.get((sym, "price")) if args.persist_imfs else None,
+    )
+    vol_feats, status_vol, vol_amp_envs = _compute_imf_features_for_series(
+        "volume", y_vol, volume.to_numpy(dtype=float), min_period_bars, max_period_frac,
+        trials=100, seed=1337, max_seconds_per_asset=args.max_seconds_per_asset,
+        persist_path=persist_paths.get((sym, "volume")) if args.persist_imfs else None,
+    )
+    # Fusion
+    fusion = _pair_price_volume(price_feats, vol_feats, price_amp_envs, vol_amp_envs)
+    # Emit rows (price)
+    if price_feats:
+        for pf in price_feats:
+            pid = int(pf["imf_id"])
+            row: Dict[str, object] = {
+                "symbol": sym,
+                "asof": asof.to_pydatetime(),
+                "series": "price",
+                "imf_id": pid,
+                "period_days": float(pf["period_bars"]) / (60.0 * 24.0),
+                "amp_pct": float(pf["amp_pct"]),
+                "energy_share": float(pf["energy_share"]),
+                "cycles_count": int(pf["cycles_count"]),
+                "pct_cycles_ge_2pct": float(pf["pct_cycles_ge_2pct"]),
+                "phase_var": float(pf["phase_var"]),
+                "status": status_price,
+            }
+            if pid in fusion:
+                f = fusion[pid]
+                row.update({
+                    "vol_amp_corr": f.get("vol_amp_corr", float("nan")),
+                    "vol_period_ratio": f.get("vol_period_ratio", float("nan")),
+                    "vol_energy_share": f.get("vol_energy_share", float("nan")),
+                })
+            rows.append(row)
+    else:
+        rows.append(_stub_row(sym, asof, "price", status_price))
+    # Emit rows (volume)
+    if vol_feats:
+        for vf in vol_feats:
+            rows.append({
+                "symbol": sym,
+                "asof": asof.to_pydatetime(),
+                "series": "volume",
+                "imf_id": int(vf["imf_id"]),
+                "period_days": float(vf["period_bars"]) / (60.0 * 24.0),
+                "amp_pct": float(vf["amp_pct"]),
+                "energy_share": float(vf["energy_share"]),
+                "cycles_count": int(vf["cycles_count"]),
+                "pct_cycles_ge_2pct": float(vf["pct_cycles_ge_2pct"]),
+                "phase_var": float(vf["phase_var"]),
+                "status": status_vol,
+            })
+    else:
+        rows.append(_stub_row(sym, asof, "volume", status_vol))
+    return rows
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="IMF stage: CEEMDAN decomposition, features, and clustering")
     p.add_argument("--leaders-csv", help="CSV with column 'symbol' for leaders")
@@ -445,77 +579,17 @@ def main() -> None:
         raise SystemExit("No history fetched")
     hist["timestamp"] = pd.to_datetime(hist["timestamp"], utc=True, errors="coerce")
 
-    # Prepare per-symbol time series
+    # Prepare per-symbol time series in parallel
     rows: List[Dict[str, object]] = []
     bars_per_symbol: Dict[str, int] = {}
-    persist_paths: Dict[Tuple[str, str], str] = {}
-
-    for sym, g in hist.groupby("symbol"):
-        g = g.dropna(subset=["timestamp"]).copy()
-        g = _reindex_1min(g, asof, win_start)
+    groups = {sym: g.sort_values("timestamp") for sym, g in hist.groupby("symbol")}
+    # Pre-compute bars per symbol after reindexing (approximate via original length)
+    for sym, g in groups.items():
         bars_per_symbol[sym] = len(g)
-        close = g["close"].astype(float)
-        volume = g["volume"].astype(float)
-        y_price, y_vol = _transform_series(close, volume, detrend=bool(args.detrend), winsorize=bool(args.winsorize))
-        # Decompose both series
-        status_price = "ok"
-        status_vol = "ok"
-        price_feats: List[Dict[str, float]] = []
-        vol_feats: List[Dict[str, float]] = []
-        min_period_bars = 3
-        max_period_frac = 2.0 / 3.0
-        if args.persist_imfs:
-            persist_paths[(sym, "price")] = os.path.join(dt_dir, "imfs", f"{sym}_price.npz")
-            persist_paths[(sym, "volume")] = os.path.join(dt_dir, "imfs", f"{sym}_volume.npz")
-        price_feats, status_price = _compute_imf_features_for_series(
-            "price", y_price, close.to_numpy(dtype=float), min_period_bars, max_period_frac,
-            trials=100, seed=1337, max_seconds_per_asset=args.max_seconds_per_asset,
-            persist_path=persist_paths.get((sym, "price")) if args.persist_imfs else None,
-        )
-        vol_feats, status_vol = _compute_imf_features_for_series(
-            "volume", y_vol, volume.to_numpy(dtype=float), min_period_bars, max_period_frac,
-            trials=100, seed=1337, max_seconds_per_asset=args.max_seconds_per_asset,
-            persist_path=persist_paths.get((sym, "volume")) if args.persist_imfs else None,
-        )
-        # Fusion: pair volume to price IMFs
-        fusion = _pair_price_volume(price_feats, vol_feats)
-        # Accumulate rows
-        for pf in price_feats:
-            row: Dict[str, object] = {
-                "symbol": sym,
-                "asof": asof.to_pydatetime(),
-                "series": "price",
-                "imf_id": int(pf["imf_id"]),
-                "period_days": float(pf["period_bars"]) / (60.0 * 24.0),
-                "amp_pct": float(pf["amp_pct"]),
-                "energy_share": float(pf["energy_share"]),
-                "cycles_count": float(pf["cycles_count"]),
-                "pct_cycles_ge_2pct": float(pf["pct_cycles_ge_2pct"]),
-                "phase_var": float(pf["phase_var"]),
-                "status": status_price,
-            }
-            if pf["imf_id"] in fusion:
-                f = fusion[int(pf["imf_id"])]
-                row.update({
-                    "vol_amp_corr": f.get("vol_amp_corr", float("nan")),
-                    "vol_period_ratio": f.get("vol_period_ratio", float("nan")),
-                    "vol_energy_share": f.get("vol_energy_share", float("nan")),
-                })
-            rows.append(row)
-        for vf in vol_feats:
-            rows.append({
-                "symbol": sym,
-                "asof": asof.to_pydatetime(),
-                "series": "volume",
-                "imf_id": int(vf["imf_id"]),
-                "period_days": float(vf["period_bars"]) / (60.0 * 24.0),
-                "amp_pct": float(vf["amp_pct"]),
-                "energy_share": float(vf["energy_share"]),
-                "cycles_count": float(vf["cycles_count"]),
-                "pct_cycles_ge_2pct": float(vf["pct_cycles_ge_2pct"]),
-                "phase_var": float(vf["phase_var"]),
-                "status": status_vol,
-            })
+    with futures.ThreadPoolExecutor(max_workers=int(args.n_jobs)) as ex:
+        futures_list = [ex.submit(_process_symbol, sym, groups[sym], asof, win_start, args) for sym in groups.keys()]
+        for fut in futures.as_completed(futures_list):
+            rows.extend(fut.result())
 
     if not rows:
         print("No IMF features computed")
@@ -524,7 +598,7 @@ def main() -> None:
     df_feat = pd.DataFrame(rows)
 
     # Clustering per series (default) or mixed pool
-    clusters_global: Dict[str, Dict[str, object]] = {}
+    clusters_global: Dict[str, Dict[str, object]] = {"price": None, "volume": None, "mixed": None}
     cards_global: Dict[str, List[Dict[str, object]]] = {"price": [], "volume": []}
 
     def cluster_pool(series: str, sub: pd.DataFrame) -> pd.DataFrame:
@@ -562,7 +636,8 @@ def main() -> None:
                 "reliability_amp": rel_a,
                 "example_symbols": g.sort_values("energy_share", ascending=False)["symbol"].head(5).tolist(),
             }
-        clusters_global[series] = {"scaler_center": scaler.center_.tolist(), "scaler_scale": scaler.scale_.tolist()}
+        key = series if series in ("price", "volume") else "mixed"
+        clusters_global[key] = {"scaler_center": scaler.center_.tolist(), "scaler_scale": scaler.scale_.tolist()}
         cards_global[series] = list(cluster_stats.values())
         # Per-asset clustering on log(period)
         asset_ids: List[str] = []
@@ -593,7 +668,7 @@ def main() -> None:
         return sub
 
     if args.cluster_mixed:
-        df_feat = cluster_pool("price", df_feat)
+        df_feat = cluster_pool("mixed", df_feat)
     else:
         parts = []
         for series in ["price", "volume"]:
@@ -691,6 +766,28 @@ def main() -> None:
         json.dump(cards_asset, f, indent=2)
 
     # Run config echo
+    # Library versions
+    try:
+        import PyEMD as _pyemd
+        v_pyemd = getattr(_pyemd, "__version__", "unknown")
+    except Exception:
+        v_pyemd = "unknown"
+    try:
+        import hdbscan as _hdb
+        v_hdb = getattr(_hdb, "__version__", "unknown")
+    except Exception:
+        v_hdb = "unknown"
+    try:
+        import sklearn as _sk
+        v_sk = getattr(_sk, "__version__", "unknown")
+    except Exception:
+        v_sk = "unknown"
+    try:
+        import scipy as _sc
+        v_sc = getattr(_sc, "__version__", "unknown")
+    except Exception:
+        v_sc = "unknown"
+
     run_config = {
         "leaders": leaders,
         "asof": asof.isoformat(),
@@ -706,6 +803,10 @@ def main() -> None:
         "versions": {
             "numpy": np.__version__,
             "pandas": pd.__version__,
+            "PyEMD": v_pyemd,
+            "hdbscan": v_hdb,
+            "scikit_learn": v_sk,
+            "scipy": v_sc,
         },
         "bars_per_symbol": bars_per_symbol,
         "paths": {
@@ -723,4 +824,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
