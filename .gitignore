@@ -7,3 +7,16 @@ __pycache__/
 # Data outputs
 *.csv
 *.log
+data/
+
+# Virtual envs
+.venv/
+
+# Backups and sidecars
+*.bak
+*.schema.json
+
+# Generated analysis outputs
+imf_clusters_*.json
+imf_clusters_*.txt
+leaderboards_summary.json
