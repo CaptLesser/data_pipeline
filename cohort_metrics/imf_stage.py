@@ -226,6 +226,7 @@ def _analyze_imf(
     series_orig: np.ndarray,
     min_period_bars: int,
     max_period_frac: float,
+    min_cycle_depth_pct: float,
 ) -> Tuple[Optional[Dict[str, float]], Optional[Tuple[np.ndarray, int, int]]]:
     # Smooth IMF
     imf = y_transformed
@@ -247,13 +248,13 @@ def _analyze_imf(
     brackets = _extrema_brackets(imf)
     # filter brackets to be inside valid slice and not too close to edges
     good_brackets = [b for b in brackets if b[0] >= guard and b[2] <= (len(imf) - guard)]
-    # Compute cycle depths in original scale; select >=2%
+    # Compute cycle depths in original scale; select >= min_cycle_depth_pct
     kept_depths: List[float] = []
     for a, b, c in good_brackets:
         d = _cycle_depth_pct(series_orig, a, b)
         d2 = _cycle_depth_pct(series_orig, b, c)
         depth = max(d, d2)
-        if depth >= 2.0:
+        if depth >= float(min_cycle_depth_pct):
             kept_depths.append(depth)
     cycles_count = len(good_brackets)
     pct_cycles_ge_2pct = float(len(kept_depths) / cycles_count * 100.0) if cycles_count > 0 else float("nan")
@@ -279,6 +280,7 @@ def _compute_imf_features_for_series(
     series_orig: np.ndarray,
     min_period_bars: int,
     max_period_frac: float,
+    min_cycle_depth_pct: float,
     trials: int,
     seed: int,
     max_seconds_per_asset: Optional[float],
@@ -298,7 +300,7 @@ def _compute_imf_features_for_series(
     energies = np.var(imfs, axis=1)
     energy_total = float(np.sum(energies)) + EPS
     for k in range(imfs.shape[0]):
-        info, amp_meta = _analyze_imf(series_name, imfs[k], series_orig, min_period_bars, max_period_frac)
+        info, amp_meta = _analyze_imf(series_name, imfs[k], series_orig, min_period_bars, max_period_frac, min_cycle_depth_pct=float(min_cycle_depth_pct))
         if info is None or amp_meta is None:
             continue
         info["energy_share"] = float(energies[k] / energy_total)
@@ -427,7 +429,12 @@ def _label_clusters(series: str, labels: np.ndarray, periods: np.ndarray) -> Tup
         medp = float(np.median(periods[idx])) if len(idx) else float("inf")
         order.append((cid, len(idx), medp))
     order.sort(key=lambda x: (-x[1], x[2]))
-    prefix = "GP" if series == "price" else "GV"
+    if series == "price":
+        prefix = "GP"
+    elif series == "volume":
+        prefix = "GV"
+    else:
+        prefix = "GM"
     mapping: Dict[int, str] = {}
     for rank, (cid, _, _) in enumerate(order, start=1):
         mapping[cid] = f"{prefix}{rank:04d}"
@@ -478,12 +485,12 @@ def _process_symbol(sym: str, g: pd.DataFrame, asof: pd.Timestamp, win_start: pd
     # Compute series
     price_feats, status_price, price_amp_envs = _compute_imf_features_for_series(
         "price", y_price, close.to_numpy(dtype=float), min_period_bars, max_period_frac,
-        trials=100, seed=1337, max_seconds_per_asset=args.max_seconds_per_asset,
+        float(args.min_cycle_depth_pct), trials=100, seed=1337, max_seconds_per_asset=args.max_seconds_per_asset,
         persist_path=persist_paths.get((sym, "price")) if args.persist_imfs else None,
     )
     vol_feats, status_vol, vol_amp_envs = _compute_imf_features_for_series(
         "volume", y_vol, volume.to_numpy(dtype=float), min_period_bars, max_period_frac,
-        trials=100, seed=1337, max_seconds_per_asset=args.max_seconds_per_asset,
+        float(args.min_cycle_depth_pct), trials=100, seed=1337, max_seconds_per_asset=args.max_seconds_per_asset,
         persist_path=persist_paths.get((sym, "volume")) if args.persist_imfs else None,
     )
     # Fusion
@@ -546,6 +553,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cluster-mixed", action="store_true", help="Pool price and volume IMFs together")
     p.add_argument("--n-jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     p.add_argument("--max-seconds-per-asset", type=float, help="Time budget per (symbol,series)")
+    p.add_argument("--min-cycle-depth-pct", type=float, default=2.0, help="Minimum cycle depth percent to keep an IMF (default 2.0)")
     p.add_argument("--detrend", action="store_true", help="Detrend price with robust Theil–Sen + Tukey capping")
     p.add_argument("--no-winsorize", dest="winsorize", action="store_false", help="Disable volume winsorization")
     p.add_argument("--out", default="data/imf", help="Output base directory")
@@ -581,11 +589,15 @@ def main() -> None:
 
     # Prepare per-symbol time series in parallel
     rows: List[Dict[str, object]] = []
-    bars_per_symbol: Dict[str, int] = {}
+    bars_per_symbol: Dict[str, Dict[str, float]] = {}
     groups = {sym: g.sort_values("timestamp") for sym, g in hist.groupby("symbol")}
-    # Pre-compute bars per symbol after reindexing (approximate via original length)
+    # Pre-compute bars_before (unique within window) and bars_after (strict 1-min grid)
+    bars_after = int(((asof - win_start).total_seconds() // 60))
     for sym, g in groups.items():
-        bars_per_symbol[sym] = len(g)
+        gf = g[(g["timestamp"] > win_start) & (g["timestamp"] <= asof)]
+        before = int(gf.drop_duplicates(subset=["timestamp"], keep="last").shape[0])
+        missing = 1.0 - (before / bars_after if bars_after > 0 else 0.0)
+        bars_per_symbol[sym] = {"bars_before": before, "bars_after": bars_after, "missing_share": missing}
     with futures.ThreadPoolExecutor(max_workers=int(args.n_jobs)) as ex:
         futures_list = [ex.submit(_process_symbol, sym, groups[sym], asof, win_start, args) for sym in groups.keys()]
         for fut in futures.as_completed(futures_list):
@@ -598,8 +610,8 @@ def main() -> None:
     df_feat = pd.DataFrame(rows)
 
     # Clustering per series (default) or mixed pool
-    clusters_global: Dict[str, Dict[str, object]] = {"price": None, "volume": None, "mixed": None}
-    cards_global: Dict[str, List[Dict[str, object]]] = {"price": [], "volume": []}
+    clusters_global: Dict[str, Optional[Dict[str, object]]] = {"price": None, "volume": None, "mixed": None}
+    cards_global: Dict[str, List[Dict[str, object]]] = {"price": [], "volume": [], "mixed": []}
 
     def cluster_pool(series: str, sub: pd.DataFrame) -> pd.DataFrame:
         if sub.empty:
@@ -637,8 +649,8 @@ def main() -> None:
                 "example_symbols": g.sort_values("energy_share", ascending=False)["symbol"].head(5).tolist(),
             }
         key = series if series in ("price", "volume") else "mixed"
-        clusters_global[key] = {"scaler_center": scaler.center_.tolist(), "scaler_scale": scaler.scale_.tolist()}
-        cards_global[series] = list(cluster_stats.values())
+        clusters_global[key] = {"scaler_center": scaler.center_.tolist(), "scaler_scale": scaler.scale_.tolist(), "features": feats}
+        cards_global[key] = list(cluster_stats.values())
         # Per-asset clustering on log(period)
         asset_ids: List[str] = []
         asset_stats: List[Dict[str, object]] = []
@@ -742,10 +754,14 @@ def main() -> None:
         df_feat.to_csv(summary_path, index=False)
 
     # Cluster cards
-    with open(os.path.join(dt_dir, "cluster_cards_global_price.json"), "w", encoding="utf-8") as f:
-        json.dump(cards_global.get("price", []), f, indent=2)
-    with open(os.path.join(dt_dir, "cluster_cards_global_volume.json"), "w", encoding="utf-8") as f:
-        json.dump(cards_global.get("volume", []), f, indent=2)
+    if args.cluster_mixed:
+        with open(os.path.join(dt_dir, "cluster_cards_global_mixed.json"), "w", encoding="utf-8") as f:
+            json.dump(cards_global.get("mixed", []), f, indent=2)
+    else:
+        with open(os.path.join(dt_dir, "cluster_cards_global_price.json"), "w", encoding="utf-8") as f:
+            json.dump(cards_global.get("price", []), f, indent=2)
+        with open(os.path.join(dt_dir, "cluster_cards_global_volume.json"), "w", encoding="utf-8") as f:
+            json.dump(cards_global.get("volume", []), f, indent=2)
 
     # Asset cards
     cards_asset: Dict[str, List[Dict[str, object]]] = {}
