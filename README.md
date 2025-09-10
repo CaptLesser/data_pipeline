@@ -283,6 +283,35 @@ Notes:
 - Deterministic by seeds; CEEMDAN runs single‑threaded for reproducibility; parallelism is per symbol (`--n-jobs`).
 - “Include everything”: once an IMF passes the gate and period sanity, it’s clustered and emitted (singletons allowed).
 
+### 9) IMF Post-Processing (CLI)
+
+Summarize the IMF stage into compact, LLM/ML-friendly tables per symbol/series with reliability-adjusted dominant cycles, weighted aggregates, interpretability bands, and templated text.
+
+Usage:
+
+```sh
+python -m cohort_metrics.imf_postprocess \
+  --summary data/imf/dt=YYYY-MM-DD/imf_summary.parquet \
+  [--cards-price .../cluster_cards_global_price.json] \
+  [--cards-volume .../cluster_cards_global_volume.json] \
+  [--cards-asset .../cluster_cards_asset.json] \
+  [--run-config .../run_config.json] \
+  [--series price|volume|both] [--asof 2024-05-18T12:00:00Z] [--window-days 90] \
+  [--min-energy-share 0.0] [--amp-bands 5 12] \
+  [--format parquet|csv] [--out-dir data/imf/dt=YYYY-MM-DD/]
+```
+
+Details:
+
+- Drops only rows with `status != 'ok'`; preserves long/rare cycles. Flags per IMF: `singleton_global_flag`, `long_cycle_flag`, `undersampled_flag`.
+- Reliability: blends cluster MAD% (period/amp) with undersampling shrinkage and a gentle size boost; missing stats fall back to neutral 0.5.
+- Dominant cycle (per symbol/series): score = `reliability * (0.6*energy_share + 0.4*min(1, amp_pct/20))`; ties → higher amp, then shorter period.
+- Aggregates: energy-weighted period/amp; diversity via unweighted MAD% of periods.
+- Amplitude bands: small <5%, medium 5–12%, large >12% (configurable).
+- Outputs (series retained when `--series both`):
+  - `imf_post_summary.parquet` — one row per symbol/series with aggregates, dominant IMF, flags, and `text_summary` (≤120 chars).
+  - `imf_post_top_imfs.parquet` — top 3 IMFs per symbol/series with key fields for analysis and QA.
+
 Optional Parquet snapshots:
 - Intraday State: `data/state/{UTC_date}/state_snapshot.parquet`
 - Daily Regime: `data/regime/{UTC_date}/regime_snapshot.parquet`
