@@ -1,5 +1,5 @@
 import math
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -122,7 +122,12 @@ def _adx(high: pd.Series, low: pd.Series, atr_val: float) -> float:
     return float(100.0 * abs(pdi - mdi) / (pdi + mdi))
 
 
-def compute_window_metrics(df: pd.DataFrame, window_size: int, suffix: str) -> Dict[str, float]:
+def compute_window_metrics(
+    df: pd.DataFrame,
+    window_size: int,
+    suffix: str,
+    min_fraction: float = 0.95,
+) -> Dict[str, float]:
     """Compute a set of technical/statistical features on the last N rows.
 
     Parameters
@@ -135,6 +140,9 @@ def compute_window_metrics(df: pd.DataFrame, window_size: int, suffix: str) -> D
         return {}
 
     win = df.tail(window_size)
+    # Guard: require sufficient bars to avoid skewing early-window results
+    if len(win) < max(1, int(window_size * min_fraction)):
+        return {}
     c = win["close"].astype(float)
     h = win["high"].astype(float)
     l = win["low"].astype(float)
@@ -209,6 +217,194 @@ def compute_window_metrics(df: pd.DataFrame, window_size: int, suffix: str) -> D
     return clean
 
 
+def compute_metrics_series(
+    df: pd.DataFrame,
+    window_size: int,
+    suffix: str,
+    min_fraction: float = 0.95,
+) -> pd.DataFrame:
+    """Compute metrics for each non-overlapping window aligned to UTC.
+
+    Returns a DataFrame with one row per window end (inclusive) containing
+    the same columns as compute_window_metrics, plus 'window_start' and 'window_end'.
+    Incomplete windows (insufficient bars) are skipped.
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    df = df.sort_values("timestamp")
+    df = df.set_index("timestamp")
+
+    # Build window buckets aligned to UTC boundaries
+    # Convert minutes to pandas offset string (H for hours when divisible by 60)
+    if window_size % 60 == 0:
+        freq = f"{window_size // 60}H"
+    else:
+        freq = f"{window_size}T"
+
+    # Map each row to its window start
+    win_start = df.index.floor(freq)
+    df = df.assign(_win_start=win_start)
+    rows: List[Dict[str, float]] = []
+    for wstart, g in df.groupby("_win_start"):
+        # expect ~ window_size rows; enforce coverage
+        if len(g) < max(1, int(window_size * min_fraction)):
+            continue
+        metrics = compute_window_metrics(
+            g.reset_index(), window_size=window_size, suffix=suffix, min_fraction=min_fraction
+        )
+        if not metrics:
+            continue
+        wend = wstart + pd.to_timedelta(window_size, unit="m")
+        row = {"window_start": wstart.to_pydatetime(), "window_end": wend.to_pydatetime()}
+        row.update(metrics)
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    return out
+
+
+def percentile_rank(value: float, population: np.ndarray) -> float:
+    """Return the percentile rank (0-100) of value within the population."""
+    arr = np.asarray(population, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan")
+    arr.sort()
+    # number of elements <= value
+    rank = np.searchsorted(arr, value, side="right")
+    return 100.0 * rank / arr.size
+
+
+def quantiles_summary(values: np.ndarray, quantiles: Iterable[float] = (5, 10, 25, 50, 75, 90, 95)) -> Dict[str, float]:
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return {f"p{int(q):02d}": float("nan") for q in quantiles}
+    qs = np.nanpercentile(arr, list(quantiles))
+    return {f"p{int(q):02d}": float(v) for q, v in zip(quantiles, qs)}
+
+
+def build_symbol_baseline(
+    symbol_df: pd.DataFrame,
+    windows_minutes: Iterable[int] = WINDOWS_MINUTES,
+    min_fraction: float = 0.95,
+) -> Dict[str, Dict[str, float]]:
+    """Build baseline percentiles and sample sizes for a single symbol.
+
+    Returns mapping metric_name -> {p05,p10,p25,p50,p75,p90,p95,n}
+    for each window suffix.
+    """
+    out: Dict[str, Dict[str, float]] = {}
+    if symbol_df.empty:
+        return out
+    for w in windows_minutes:
+        sfx = SUFFIX.get(w, f"{w}m")
+        series_df = compute_metrics_series(symbol_df.copy(), w, sfx, min_fraction=min_fraction)
+        if series_df.empty:
+            continue
+        # Drop non-metric columns
+        metric_cols = [c for c in series_df.columns if c not in ("window_start", "window_end")]
+        for col in metric_cols:
+            vals = series_df[col].to_numpy(dtype=float)
+            stats = quantiles_summary(vals)
+            stats["n"] = float(np.isfinite(vals).sum())
+            out[col] = stats
+    return out
+
+
+def enrich_current_with_baseline(
+    current_df: pd.DataFrame,
+    baselines: Dict[str, Dict[str, Dict[str, float]]],
+) -> pd.DataFrame:
+    """Append percentile/quintile and key baseline quantiles to current metrics.
+
+    Adds for each metric column M:
+      - M_pctile (0-100)
+      - M_quintile (1..5)
+      - M_p25, M_p50, M_p75
+      - M_n (number of baseline samples)
+      - M_direction ('under' if value < p50 else 'over')
+    """
+    if current_df.empty:
+        return current_df
+
+    rows: List[Dict[str, float]] = []
+    for _, r in current_df.iterrows():
+        sym = r["symbol"]
+        b = baselines.get(sym, {})
+        enriched = r.to_dict()
+        for col, val in r.items():
+            if col == "symbol":
+                continue
+            base = b.get(col)
+            if base is None:
+                continue
+            p25 = base.get("p25")
+            p50 = base.get("p50")
+            p75 = base.get("p75")
+            n = base.get("n", 0.0)
+
+            # Percentile rank requires the full distribution; approximate using
+            # piecewise linear interpolation between stored percentiles when full
+            # distribution is not available. Here we use p10,p25,p50,p75,p90 as knots.
+            knots = []
+            knot_pct = []
+            for q in (10, 25, 50, 75, 90):
+                pv = base.get(f"p{q:02d}")
+                if pv is not None and math.isfinite(pv):
+                    knots.append(pv)
+                    knot_pct.append(float(q))
+            pctile = float("nan")
+            if len(knots) >= 2 and math.isfinite(val):
+                xs = np.array(knots, dtype=float)
+                ys = np.array(knot_pct, dtype=float)
+                # Ensure xs is monotonically non-decreasing
+                order = np.argsort(xs)
+                xs = xs[order]
+                ys = ys[order]
+                pctile = float(np.interp(val, xs, ys, left=0.0, right=100.0))
+
+            # Quintile by comparing to p20,p40,p60,p80 (approx via p25/p50/p75)
+            q_breaks = [
+                base.get("p20", base.get("p25")),
+                base.get("p40", base.get("p50")),
+                base.get("p60", base.get("p75")),
+                base.get("p80", base.get("p90")),
+            ]
+            quintile = 1
+            if math.isfinite(val):
+                quintile = 1
+                for i, brk in enumerate(q_breaks, start=1):
+                    if brk is None or not math.isfinite(brk):
+                        continue
+                    if val > brk:
+                        quintile = i + 1
+            # Clamp 1..5
+            quintile = max(1, min(5, quintile))
+
+            direction = None
+            if p50 is not None and math.isfinite(p50) and math.isfinite(val):
+                direction = "over" if val >= p50 else "under"
+
+            enriched[f"{col}_pctile"] = pctile
+            enriched[f"{col}_quintile"] = quintile
+            if p25 is not None:
+                enriched[f"{col}_p25"] = p25
+            if p50 is not None:
+                enriched[f"{col}_p50"] = p50
+            if p75 is not None:
+                enriched[f"{col}_p75"] = p75
+            enriched[f"{col}_n"] = n
+            if direction is not None:
+                enriched[f"{col}_direction"] = direction
+
+        rows.append(enriched)
+    return pd.DataFrame(rows)
+
+
+
 def compute_symbol_metrics(symbol_df: pd.DataFrame, windows_minutes: Iterable[int] = WINDOWS_MINUTES) -> Dict[str, float]:
     """Compute metrics for one symbol across requested windows."""
     df = symbol_df.copy()
@@ -251,4 +447,3 @@ def compute_cohort_metrics(input_csv: str, output_csv: str, windows_minutes: Ite
     result = pd.DataFrame(rows)
     result.to_csv(output_csv, index=False)
     return result
-

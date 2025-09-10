@@ -1,1 +1,9 @@
 kraken_top_losers.csv
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+
+# Data outputs
+*.csv
+*.log
