@@ -6,7 +6,9 @@ The initial assumption is that you already have 1-minute OHLCVT bars in a MySQL 
 
 ## Features
 - Leaderboards from MySQL minute bars (`leaderboards.py`): habitual gainers, losers, and overlaps across 1h/4h/12h/24h windows (optionally 72h) with skew tagging and summaries.
+- Intraday State & Daily Regime snapshots (CLIs): compute resample-first, window-aligned features with baseline enrichment, neutral imputation, and Parquet output (partitioned by UTC date).
  - Intraday State & Daily Regime snapshots (CLIs): compute resample-first, window-aligned features with baseline enrichment, neutral imputation, and Parquet output (partitioned by UTC date).
+ - IMF Stage (CLI): CEEMDAN-based cycle decomposition of price/volume, feature extraction, per-series clustering (HDBSCAN + KMeans fallback), and reliability via MAD%, with Parquet + JSON outputs.
 - IMF-based clustering on leader cohorts (`imf_cluster_{gainers,losers,overlaps}.py`): EMD cycle extraction + GMM/DBSCAN clustering with JSON and text summaries.
 - Kraken 24h top losers (`kraken_losers.py`): fetch USD-quoted pairs, compute daily % change, export CSV for quick research.
 - Fetch 30-day history for losers (`fetch_loser_history.py`): read tickers from CSV and pull last 30 days of MySQL OHLCVT.
@@ -242,6 +244,44 @@ Details:
 - Join contract: join with Intraday State on `(symbol, timestamp_asof_utc)`.
 
 Imputation follows the same neutral rules as Intraday State.
+
+### 8) IMF Stage (CLI)
+
+Decompose minute-level price and volume for a leaders set using CEEMDAN, detect robust cycles (Hilbert + extrema with ¼-period edge guard and a hard depth gate), build per-IMF features, and cluster per series (price, volume) — or as a mixed pool if requested. Emits join-friendly Parquet and cluster “cards” JSON.
+
+Usage:
+
+```sh
+python -m cohort_metrics.imf_stage \
+  --leaders-csv leaders.csv \
+  --asof 2024-05-18T12:00:00Z \
+  --lookback-months 3 \
+  --host <MYSQL_HOST> --user <MYSQL_USER> --database <DB_NAME> --password <PASSWORD> [--port 3306] [--table ohlcvt] \
+  [--persist-imfs] [--cluster-mixed] [--n-jobs 7] [--max-seconds-per-asset 30] \
+  [--min-cycle-depth-pct 2.0] [--detrend] [--no-winsorize] [--out data/imf]
+```
+
+Key details:
+
+- Inputs: leaders from `--leaders-csv` (column `symbol`) or `--leaders` list. Minute OHLCV fetched with the same `lookback_months` as metrics.
+- Windowing: `asof` anchors the end; window_start = `asof − lookback_months` (calendar months). Strict 1‑min UTC grid; de‑dupe by last; `close` ffill/backfill at window start; `volume` zeros for gaps.
+- Transforms: price `log(close)` with optional robust Theil–Sen detrend; volume winsorize raw at [1,99] then `log1p`.
+- Decomposition: CEEMDAN `trials=100, seed=1337`; budget flag `--max-seconds-per-asset` sets `status=time_budget_reduced` (no rerun).
+- Cycle gate: Hilbert + extrema must pass; hard minimum depth `--min-cycle-depth-pct` (default 2.0) on back‑transformed midline % depth; min period bars=3; max period ≤ 2/3 of window bars; edge guard = ¼ median period for summaries.
+- Features per IMF: `period_days`, `amp_pct`, `energy_share`, `cycles_count`, `pct_cycles_ge_2pct`, `phase_var`. For price IMFs, fusion to closest-volume IMF adds `vol_amp_corr` (Hilbert envelope corr), `vol_period_ratio`, `vol_energy_share`.
+- Clustering: per-series pools by default (price→GP####, volume→GV####); `--cluster-mixed` for one pool (GM####). HDBSCAN (leaf), noise→unique singletons; fallback to KMeans (best silhouette). Per-asset merge via Ward on ln(period) to A:<SYMBOL>:####.
+- Reliability: MAD% (period, amp) and `exp(-MAD%/25)` scores; singletons keep MAD%=NaN and reliability=0.0.
+- Outputs (under `data/imf/dt=YYYY-MM-DD/`):
+  - `imf_summary.parquet` (snappy) — row per kept IMF with features, labels, and redundant cluster stats (global/asset).
+  - Global cards: `cluster_cards_global_price.json` and `cluster_cards_global_volume.json` (or `cluster_cards_global_mixed.json` when `--cluster-mixed`).
+  - Asset cards: `cluster_cards_asset.json` per symbol.
+  - Optional IMFs: `imfs/<SYMBOL>_{price,volume}.npz` when `--persist-imfs`.
+  - `run_config.json` echoing parameters, seeds, library versions, scaler metadata (center/scale/features per pool), and bars coverage per symbol (`bars_before`, `bars_after`, `missing_share`).
+
+Notes:
+
+- Deterministic by seeds; CEEMDAN runs single‑threaded for reproducibility; parallelism is per symbol (`--n-jobs`).
+- “Include everything”: once an IMF passes the gate and period sanity, it’s clustered and emitted (singletons allowed).
 
 Optional Parquet snapshots:
 - Intraday State: `data/state/{UTC_date}/state_snapshot.parquet`
