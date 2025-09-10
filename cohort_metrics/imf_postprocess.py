@@ -121,7 +121,11 @@ def main() -> None:
         return any(cid.startswith(p) for p in ("GP9", "GV9", "GM9"))
 
     df["singleton_global_flag"] = df["cluster_id_global"].astype(str).apply(singleton_flag)
-    df["expected_cycles"] = window_days / df["period_days"].astype(float)
+    # Null-safe division for expected cycles
+    per = df["period_days"].astype(float).to_numpy()
+    df["expected_cycles"] = np.divide(
+        float(window_days), per, out=np.full_like(per, np.nan, dtype=float), where=per > 0
+    )
     df["undersampled_flag"] = df["expected_cycles"] < 1.5
     df["long_cycle_flag"] = df["period_days"] > (2.0 / 3.0) * window_days
 
@@ -143,7 +147,12 @@ def main() -> None:
     df["reliability"] = reliability.astype(float)
 
     # Score (Option B)
-    df["selection_score"] = df.apply(lambda r: _dominant_score(r["reliability"], r["energy_share"], r["amp_pct"]), axis=1)
+    # Vectorized selection score
+    rel = df["reliability"].astype(float).to_numpy()
+    es = df["energy_share"].astype(float).to_numpy()
+    amp = df["amp_pct"].astype(float).to_numpy()
+    comp = 0.6 * es + 0.4 * np.minimum(1.0, amp / 20.0)
+    df["selection_score"] = (rel * comp).astype(float)
 
     # Amplitude bands
     small, medium = float(args.amp_bands[0]), float(args.amp_bands[1])
@@ -184,17 +193,20 @@ def main() -> None:
         dom_amp = float(dom["amp_pct"]) if np.isfinite(dom["amp_pct"]) else float("nan")
         dom_rel = float(dom["reliability"]) if np.isfinite(dom["reliability"]) else float("nan")
         dom_band = str(dom["amp_band"]) if isinstance(dom["amp_band"], str) else ""
-        alt_txt = "/".join(filter(None, [
-            f"{float(alt1['period_days']):.1f}" if alt1 is not None and np.isfinite(alt1["period_days"]) else "",
-            f"{float(alt2['period_days']):.1f}" if alt2 is not None and np.isfinite(alt2["period_days"]) else "",
-        ]))
+        alt_parts = []
+        if alt1 is not None and np.isfinite(alt1["period_days"]):
+            alt_parts.append(f"{float(alt1['period_days']):.1f}")
+        if alt2 is not None and np.isfinite(alt2["period_days"]):
+            alt_parts.append(f"{float(alt2['period_days']):.1f}")
+        alt_txt = "/".join(alt_parts)
         cid = str(dom.get("cluster_id_global", ""))
-        cid_part = f" ({cid})" if cid and len(cid) <= 8 else ""
+        # Only show cluster id for singletons to save space
+        cid_part = f" ({cid})" if bool(dom.get("singleton_global_flag", False)) and cid else ""
         unders = "yes" if bool(dom.get("undersampled_flag", False)) else "no"
-        text_summary = (
-            f"Cycle ~{dom_period:.1f}d, {dom_band} (≈{dom_amp:.1f}%). "
-            f"Alt: {alt_txt}d. Rel {dom_rel:.2f}{cid_part}; undersampled: {unders}."
-        ).strip()
+        base_txt = f"Cycle ~{dom_period:.1f}d, {dom_band} (≈{dom_amp:.1f}%). "
+        if alt_txt:
+            base_txt += f"Alt: {alt_txt}d. "
+        text_summary = (base_txt + f"Rel {dom_rel:.2f}{cid_part}; undersampled: {unders}.").strip()
         miss_share = syms_missing.get(sym, None)
         # summary row
         rows_summary.append({
@@ -215,6 +227,10 @@ def main() -> None:
             "dom_expected_cycles": float(dom["expected_cycles"]),
             "dom_singleton_global_flag": bool(dom.get("singleton_global_flag", False)),
             "dom_undersampled_flag": bool(dom.get("undersampled_flag", False)),
+            "dom_long_cycle_flag": bool(dom.get("long_cycle_flag", False)),
+            # Coupling on price rows if available
+            "dom_vol_amp_corr": float(dom.get("vol_amp_corr", np.nan)) if series == "price" else float("nan"),
+            "dom_vol_period_ratio": float(dom.get("vol_period_ratio", np.nan)) if series == "price" else float("nan"),
             "missing_share": float(miss_share) if miss_share is not None else float("nan"),
             "text_summary": text_summary,
         })
@@ -233,6 +249,7 @@ def main() -> None:
                 "cluster_size_global": int(getattr(r, "cluster_size_global")) if np.isfinite(getattr(r, "cluster_size_global", np.nan)) else 0,
                 "singleton_global_flag": bool(getattr(r, "singleton_global_flag")),
                 "undersampled_flag": bool(getattr(r, "undersampled_flag")),
+                "long_cycle_flag": bool(getattr(r, "long_cycle_flag")),
             })
 
     post_summary = pd.DataFrame(rows_summary)
@@ -255,4 +272,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
