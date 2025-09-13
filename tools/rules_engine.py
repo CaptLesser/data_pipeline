@@ -235,7 +235,14 @@ def rules_for_timeframe(row: pd.Series,
                     notes.append(f"squeeze_ratio={squeeze_ratio:.2f}")
             if imf_method:
                 notes.append(f"imf_window={IMF_TF_MAP.get(sfx,'24h')}:{imf_method}")
-            notes.append("trigger=above_band" if status == "trigger" else "setup=near_upper")
+            if status == "trigger":
+                notes.append("trigger=above_band")
+            else:
+                if isinstance(upper, (int, float)) and isinstance(atr, (int, float)):
+                    dist = upper - price if (isinstance(price, (int, float))) else float("nan")
+                    notes.append(f"setup=within_0.5ATR_upper: gap={dist:.6f}")
+                else:
+                    notes.append("setup=near_upper")
             note_txt = "; ".join(notes)
             out.append({
                 "symbol": row.get("symbol"),
@@ -250,6 +257,8 @@ def rules_for_timeframe(row: pd.Series,
                 "tags": ",".join(tags),
                 "notes": note_txt,
                 "asof": asof.isoformat() if hasattr(asof, "isoformat") else str(asof),
+                "imf_window_used": IMF_TF_MAP.get(sfx, "24h"),
+                "imf_method": imf_method or "",
             })
 
     # Mean-reversion trigger/setup
@@ -265,7 +274,14 @@ def rules_for_timeframe(row: pd.Series,
             if isinstance(lower, (int, float)):
                 stop_band = float(lower) - cfg["stops"]["band_buffer_atr"] * float(atr)
             stop_candidates = [s for s in [stop_atr, stop_band] if isinstance(s, (int, float)) and math.isfinite(s)]
-            stop = min(stop_candidates) if stop_candidates else stop_atr
+            policy = str(cfg.get("stops", {}).get("reversion_policy", "conservative")).lower()
+            if stop_candidates:
+                if policy == "wide":
+                    stop = min(stop_candidates)
+                else:  # conservative default
+                    stop = max(stop_candidates)
+            else:
+                stop = stop_atr
             # Favor small amplitude targets for reversion if IMF small; else cap by ROI cap
             base_amp = float(amp) if math.isfinite(amp) else cfg["targets"]["default_t1_pct"]
             t1_pct = min(base_amp, cfg["targets"]["roi_cap_pct"])
@@ -295,6 +311,8 @@ def rules_for_timeframe(row: pd.Series,
                 "tags": ",".join(tags),
                 "notes": note_txt,
                 "asof": asof.isoformat() if hasattr(asof, "isoformat") else str(asof),
+                "imf_window_used": IMF_TF_MAP.get(sfx, "24h"),
+                "imf_method": imf_method or "",
             })
 
     return out
@@ -308,6 +326,7 @@ def load_config(path: Optional[str]) -> Dict:
             "breakout_atr_mult": 1.25,
             "reversion_atr_mult": 0.85,
             "band_buffer_atr": 0.1,
+            "reversion_policy": "conservative",
         },
         "targets": {
             "roi_cap_pct": 25.0,
@@ -322,6 +341,9 @@ def load_config(path: Optional[str]) -> Dict:
         },
         "timing": {
             "default_hold_min": 1440.0,
+        },
+        "regime": {
+            "join_tolerance_days": 3,
         },
     }
     if path and os.path.exists(path) and yaml is not None:
@@ -361,24 +383,28 @@ def main() -> None:
     metrics = load_metrics(args.metrics)
     imf_map = load_imf_summary(args.imf_json, args.imf_txt)
     regime_df = load_regime(args.regime)
-    if regime_df is not None and "symbol" in regime_df.columns:
-        # Join key: (symbol, timestamp_asof_utc)
-        regime_key = regime_df.set_index(["symbol", "timestamp_asof_utc"]) if "timestamp_asof_utc" in regime_df.columns else regime_df.set_index(["symbol"])
-    else:
-        regime_key = None
 
     rows: List[Dict[str, object]] = []
     for sym, g in metrics.groupby("symbol"):
         imf = imf_map.get(str(sym), {})
         regime_row = None
-        if regime_key is not None:
-            key = (sym, g["timestamp_asof_utc"].iloc[0]) if "timestamp_asof_utc" in g.columns else sym
+        if regime_df is not None and "symbol" in regime_df.columns:
             try:
-                regime_row = regime_key.loc[key]
+                sym_reg = regime_df[regime_df["symbol"] == sym]
+                if not sym_reg.empty and "timestamp_asof_utc" in sym_reg.columns and "timestamp_asof_utc" in g.columns:
+                    asof = pd.to_datetime(g["timestamp_asof_utc"].iloc[0], utc=True, errors="coerce")
+                    sym_reg = sym_reg.copy()
+                    sym_reg["_delta"] = (sym_reg["timestamp_asof_utc"] - asof).abs()
+                    rr = sym_reg.sort_values("_delta").iloc[0]
+                    tol_days = float(cfg.get("regime", {}).get("join_tolerance_days", 3))
+                    if pd.notna(rr.get("_delta")) and getattr(rr.get("_delta"), 'days', 9999) <= tol_days:
+                        regime_row = rr
+                    else:
+                        regime_row = sym_reg.sort_values("timestamp_asof_utc").iloc[-1]
+                elif not sym_reg.empty:
+                    regime_row = sym_reg.sort_values("timestamp_asof_utc").iloc[-1] if "timestamp_asof_utc" in sym_reg.columns else sym_reg.iloc[-1]
             except Exception:
                 regime_row = None
-            if isinstance(regime_row, pd.DataFrame):
-                regime_row = regime_row.iloc[0]
         r = g.iloc[0]
         for tf in cfg["timeframes"]:
             signals = rules_for_timeframe(r, tf, imf, regime_row, cfg)
@@ -405,9 +431,12 @@ def main() -> None:
         for sym, sg in sig_df.groupby("symbol"):
             lines.append(f"[{sym}]")
             for _, r2 in sg.head(6).iterrows():
-                lines.append(
-                    f"- {r2['timeframe']} {r2['signal_type']} ({r2['status']}): conf={r2['confidence']:.2f}, roi/h={r2['roi_per_hour']:.2f}, tags={r2['tags']}"
-                )
+                try:
+                    lines.append(
+                        f"- {r2['timeframe']} {r2['signal_type']} ({r2['status']}): hold_min={r2.get('expected_hold_min','')}, target1={r2.get('target1','')}, tags={r2.get('tags','')}"
+                    )
+                except Exception:
+                    lines.append(f"- {r2}")
             lines.append("")
         with open("signals.txt", "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
