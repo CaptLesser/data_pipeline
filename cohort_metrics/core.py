@@ -771,6 +771,12 @@ def compute_symbol_metrics(symbol_df: pd.DataFrame, windows_minutes: Iterable[in
                 anchors.append(tmax.floor(rule))
             anchor = min(anchors) if anchors else tmax
             out["timestamp_asof_utc"] = anchor.to_pydatetime()
+            # Include current (as-of) price for LLM/forecast downstreams
+            try:
+                last_close = float(df.loc[df["timestamp"] <= anchor, "close"].astype(float).iloc[-1])
+            except Exception:
+                last_close = float("nan")
+            out["close_current"] = last_close
     except Exception:
         pass
 
