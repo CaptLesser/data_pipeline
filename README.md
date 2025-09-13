@@ -37,6 +37,56 @@ pip install EMD-signal scikit-learn scipy kneed
 
 ## Usage
 
+### Recommended Sequence (Overlap Analysis)
+
+1) Install dependencies
+
+```sh
+pip install -r requirements.txt
+```
+
+2) Generate leaderboards (produce `habitual_overlaps.csv`)
+
+```sh
+python leaderboards.py \
+  --host <MYSQL_HOST> \
+  --user <MYSQL_USER> \
+  --database <DB_NAME> \
+  --port 3306 \
+  --top-n 20
+```
+
+- Outputs: `leaderboards_summary.json`, `habitual_overlaps.csv` (plus gainers/losers CSVs)
+- If flags are omitted, the script prompts interactively (no password flag required).
+
+3) Quantify overlap behaviors (metrics + baselines)
+
+```sh
+python -m cohort_metrics.overlaps.metrics \
+  --input habitual_overlaps.csv \
+  --output overlap_metrics.csv \
+  --months 3 \
+  --host <MYSQL_HOST> --user <MYSQL_USER> --database <DB_NAME> --port 3306 --table ohlcvt
+```
+
+- Output: `overlap_metrics.csv` with multi-window features and baseline enrichment.
+- Omitting `--password` will prompt securely. To skip baselines, add `--no-baseline`.
+
+4) IMF clustering on overlaps (cycle profiles)
+
+```sh
+python imf_cluster_overlaps.py
+```
+
+- Outputs: `imf_clusters_overlaps.json`, `imf_clusters_overlaps.txt` (and `pipeline.log`).
+
+Optional (joinable context):
+
+```sh
+python -m cohort_metrics.state  --input habitual_overlaps.csv --out data/state  --windows 1h,4h,12h,24h
+python -m cohort_metrics.regime --input habitual_overlaps.csv --out data/regime --windows 3d,7d,14d,30d,90d
+```
+
 ### 1) Generate Leaderboards from MySQL
 Computes disjoint-window metrics, ranks top-N per bucket, aggregates habitual gainers/losers/overlaps, tags skew, and writes a summary plus full time series CSVs for the top cohorts.
 
