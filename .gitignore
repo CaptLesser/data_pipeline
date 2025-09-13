@@ -20,3 +20,5 @@ data/
 imf_clusters_*.json
 imf_clusters_*.txt
 leaderboards_summary.json
+# Local temp splits (keep out of VCS)
+tmp_part*.txt
