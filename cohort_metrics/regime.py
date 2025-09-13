@@ -13,7 +13,7 @@ from typing import Dict, Iterable, Optional, List
 import pandas as pd
 import numpy as np
 
-from .core import EPS, _bollinger, _atr, _adx, enrich_current_with_baseline
+from .core import EPS, _bollinger, _atr, _adx, enrich_current_with_baseline, resolve_input_path, normalize_ohlcv_columns
 import argparse
 import json
 
@@ -177,7 +177,9 @@ def compute_regime_snapshot(
     asof: Optional[datetime] = None,
     breakout_lookback_days: int = 20,
 ) -> pd.DataFrame:
-    df = pd.read_csv(cohort_csv)
+    path = resolve_input_path(cohort_csv)
+    df = pd.read_csv(path)
+    df = normalize_ohlcv_columns(df)
     if df.empty:
         return pd.DataFrame(columns=["symbol"])  # empty
     if "timestamp" in df.columns:
@@ -367,7 +369,9 @@ def main() -> None:
     args = parse_args()
     windows = _parse_windows_days(args.windows)
     # Load
-    df = pd.read_csv(args.input)
+    path0 = resolve_input_path(args.input)
+    df = pd.read_csv(path0)
+    df = normalize_ohlcv_columns(df)
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     if df.empty:
@@ -382,7 +386,7 @@ def main() -> None:
 
     # Compute
     snapshot = compute_regime_snapshot(
-        cohort_csv=args.input,
+        cohort_csv=path0,
         windows_days=windows,
         baselines=None,
         db_fetch_fn=None,

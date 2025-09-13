@@ -18,7 +18,11 @@ from typing import List, Dict, Any
 # ─── CONFIG ─────────────────────────────────────────────────────────────
 
 # Load leaderboard data directly from CSV (no database dependency).
-DF = pd.read_csv('habitual_losers.csv', parse_dates=['timestamp'])
+from cohort_metrics.core import normalize_ohlcv_columns
+DF = pd.read_csv('habitual_losers.csv')
+DF = normalize_ohlcv_columns(DF)
+if 'timestamp' in DF.columns:
+    DF['timestamp'] = pd.to_datetime(DF['timestamp'], utc=True, errors='coerce')
 COINS = DF['symbol'].unique().tolist()
 
 # Time windows (in days) to analyze: 6h, 12h, 24h, 3d, 7d, 30d

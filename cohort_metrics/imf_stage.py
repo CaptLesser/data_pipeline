@@ -52,8 +52,13 @@ def _parse_leaders(leaders_csv: Optional[str], leaders_list: Optional[str]) -> L
     syms: List[str] = []
     if leaders_csv:
         df = pd.read_csv(leaders_csv)
-        if "symbol" not in df.columns:
-            raise ValueError("leaders CSV must include 'symbol' column")
+        # Normalize symbol column case-insensitively with common synonyms
+        cols_lower = {c.lower().strip(): c for c in df.columns}
+        sym_col = cols_lower.get("symbol") or cols_lower.get("sym") or cols_lower.get("ticker") or cols_lower.get("asset")
+        if not sym_col:
+            raise ValueError("leaders CSV must include a 'symbol' column (or synonyms: sym, ticker, asset)")
+        if sym_col != "symbol":
+            df = df.rename(columns={sym_col: "symbol"})
         syms = df["symbol"].dropna().astype(str).tolist()
     if leaders_list:
         syms.extend([s.strip() for s in leaders_list.split(",") if s.strip()])

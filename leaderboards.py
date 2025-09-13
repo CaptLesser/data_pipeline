@@ -1,4 +1,4 @@
-"""Generate multi-timeframe leaderboards for habitual losers, gainers, and
+﻿"""Generate multi-timeframe leaderboards for habitual losers, gainers, and
 overlap coins based on OHLCVT minute bars stored in MySQL.
 
 Workflow:
@@ -120,7 +120,7 @@ def compute_window_stats(df: pd.DataFrame, window_hours: int) -> pd.DataFrame:
 
     resampled = (
         df.resample(
-            f"{window_hours}H",
+            f"{window_hours}h",
             label="left",
             closed="left",
             origin="epoch",
@@ -446,7 +446,7 @@ def main() -> None:
             vol = metrics.get("pct_vol_change", float("nan"))
             tag_list = tags.get(c, [])
             tag_str = ", ".join(tag_list) or "None"
-            print(f"[{c}] PriceΔ: {price:+.2f}% VolΔ: {vol:+.2f}% Skew: {tag_str}")
+            print(f"[{c}] Price: {price:+.2f}% Vol: {vol:+.2f}% Skew: {tag_str}")
             section["coins"].append(
                 {
                     "symbol": c,

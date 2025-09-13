@@ -12,6 +12,8 @@ from .core import (
     compute_symbol_metrics,
     build_symbol_baseline,
     enrich_current_with_baseline,
+    resolve_input_path,
+    normalize_ohlcv_columns,
 )
 
 
@@ -34,7 +36,10 @@ def compute_state_snapshot(
     If baselines are provided (or db_fetch_fn+engine are given), enrich with
     percentiles/quintiles and robust-z.
     """
-    df = pd.read_csv(cohort_csv)
+    # Robust load: resolve path + normalize columns
+    path = resolve_input_path(cohort_csv)
+    df = pd.read_csv(path)
+    df = normalize_ohlcv_columns(df)
     if df.empty:
         return pd.DataFrame(columns=["symbol"])  # empty template
     if "timestamp" in df.columns:
@@ -250,7 +255,9 @@ def main() -> None:
     asof = pd.to_datetime(args.asof, utc=True) if args.asof else None
 
     # Optionally dry-run: report planned anchor and coverage
-    df = pd.read_csv(args.input)
+    path0 = resolve_input_path(args.input)
+    df = pd.read_csv(path0)
+    df = normalize_ohlcv_columns(df)
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     if df.empty:
@@ -288,7 +295,7 @@ def main() -> None:
 
     # Compute snapshot and enrichment
     snapshot = compute_state_snapshot(
-        cohort_csv=args.input,
+        cohort_csv=path0,
         months_history=args.months,
         baselines=baselines,
         db_fetch_fn=None,

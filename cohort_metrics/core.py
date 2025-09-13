@@ -1,5 +1,7 @@
 import math
 from typing import Dict, Iterable, List, Tuple, Optional
+import os
+import difflib
 
 import numpy as np
 import pandas as pd
@@ -858,7 +860,11 @@ def compute_cohort_metrics(input_csv: str, output_csv: str, windows_minutes: Ite
     """Read a cohort CSV (symbol,timestamp,open,high,low,close,volume) and
     write per-symbol metrics to output_csv. Returns the DataFrame written.
     """
+    # Resolve input path robustly (case-insensitive + fuzzy match)
+    input_csv = resolve_input_path(input_csv)
     df = pd.read_csv(input_csv)
+    # Normalize column names (case-insensitive + common synonyms)
+    df = normalize_ohlcv_columns(df)
     if df.empty:
         result = pd.DataFrame(columns=["symbol"])  # empty template
         result.to_csv(output_csv, index=False)
@@ -878,3 +884,90 @@ def compute_cohort_metrics(input_csv: str, output_csv: str, windows_minutes: Ite
     result = pd.DataFrame(rows)
     result.to_csv(output_csv, index=False)
     return result
+
+
+def resolve_input_path(path: str, search_dir: Optional[str] = None, exts: Tuple[str, ...] = (".csv", ".parquet")) -> str:
+    """Resolve a possibly misspelled or case-variant file path.
+
+    - Returns the existing path if it exists.
+    - Else, searches `search_dir` (default cwd) for case-insensitive and fuzzy filename matches
+      among files with extensions in `exts`.
+    - Raises FileNotFoundError with suggestions when not found.
+    """
+    if not path:
+        raise FileNotFoundError("Input path is empty")
+    if os.path.exists(path):
+        return path
+    base = os.path.basename(path)
+    stem, _ = os.path.splitext(base)
+    root = search_dir or os.getcwd()
+    candidates: List[str] = []
+    for fname in os.listdir(root):
+        fp = os.path.join(root, fname)
+        if not os.path.isfile(fp):
+            continue
+        fstem, fext = os.path.splitext(fname)
+        if fext.lower() not in exts:
+            continue
+        candidates.append(fname)
+        # exact case-insensitive match
+        if fname.lower() == base.lower():
+            return fp
+    # Fuzzy match by stem
+    close = difflib.get_close_matches(stem.lower(), [os.path.splitext(c)[0].lower() for c in candidates], n=3, cutoff=0.6)
+    if close:
+        # Map back to original case filenames
+        mapping = {os.path.splitext(c)[0].lower(): c for c in candidates}
+        suggestion = mapping.get(close[0])
+        if suggestion:
+            return os.path.join(root, suggestion)
+    # No match found
+    msg = f"Input file not found: {path}"
+    if candidates:
+        msg += f". Nearby candidates: {', '.join(sorted(candidates)[:5])}"
+    raise FileNotFoundError(msg)
+
+
+def normalize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize column names to expected OHLCV schema with case-insensitive mapping and synonyms.
+
+    Expected: symbol, timestamp, open, high, low, close, volume (trades optional)
+    Synonyms handled:
+      - symbol: [symbol, sym, ticker, asset]
+      - timestamp: [timestamp, time, date, datetime]
+      - volume: [volume, vol, qty, quantity, amount]
+    Non-matching columns remain unchanged.
+    """
+    if df is None or df.empty:
+        return df
+    original = list(df.columns)
+    lower_map: Dict[str, str] = {str(c).lower().strip(): c for c in original}
+
+    def have(*names: str) -> Optional[str]:
+        for n in names:
+            if n in lower_map:
+                return lower_map[n]
+        return None
+
+    rename: Dict[str, str] = {}
+    # symbol
+    sym_col = have("symbol", "sym", "ticker", "asset")
+    if sym_col and sym_col != "symbol":
+        rename[sym_col] = "symbol"
+    # timestamp
+    ts_col = have("timestamp", "time", "date", "datetime")
+    if ts_col and ts_col != "timestamp":
+        rename[ts_col] = "timestamp"
+    # open/high/low/close
+    for k in ["open", "high", "low", "close"]:
+        c = have(k)
+        if c and c != k:
+            rename[c] = k
+    # volume
+    vol_col = have("volume", "vol", "qty", "quantity", "amount")
+    if vol_col and vol_col != "volume":
+        rename[vol_col] = "volume"
+
+    if rename:
+        df = df.rename(columns=rename)
+    return df

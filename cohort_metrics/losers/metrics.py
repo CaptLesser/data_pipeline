@@ -5,6 +5,7 @@ from cohort_metrics.core import (
     compute_cohort_metrics,
     build_symbol_baseline,
     enrich_current_with_baseline,
+    resolve_input_path,
 )
 from cohort_metrics.db import get_db_engine, fetch_history_months
 
@@ -30,7 +31,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    current_df = compute_cohort_metrics(args.input, args.output)
+    input_path = resolve_input_path(args.input)
+    current_df = compute_cohort_metrics(input_path, args.output)
 
     if args.no_baseline or current_df.empty:
         return

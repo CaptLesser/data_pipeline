@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import json
 import os
 from datetime import datetime, timezone
@@ -203,7 +203,7 @@ def main() -> None:
         # Only show cluster id for singletons to save space
         cid_part = f" ({cid})" if bool(dom.get("singleton_global_flag", False)) and cid else ""
         unders = "yes" if bool(dom.get("undersampled_flag", False)) else "no"
-        base_txt = f"Cycle ~{dom_period:.1f}d, {dom_band} (≈{dom_amp:.1f}%). "
+        base_txt = f"Cycle ~{dom_period:.1f}d, {dom_band} ({dom_amp:.1f}%). "
         if alt_txt:
             base_txt += f"Alt: {alt_txt}d. "
         text_summary = (base_txt + f"Rel {dom_rel:.2f}{cid_part}; undersampled: {unders}.").strip()
