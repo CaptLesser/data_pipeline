@@ -82,6 +82,19 @@ python imf_cluster_overlaps.py
 
 Optional (joinable context):
 
+
+5) Emit rule-based trade signals (human-readable)
+
+```sh
+python tools/rules_engine.py \\
+  --metrics overlap_metrics.csv \\
+  --imf-json imf_clusters_overlaps.json \\
+  [--regime data/regime/dt=YYYY-MM-DD/regime_snapshot.parquet] \\
+  [--timeframes 1h,4h,12h,24h] [--config rules_config.yaml] [--write-cards]
+```
+
+- Outputs: `signals.csv` (multi-row per asset) and optional `signals.txt` play cards.
+- Defaults: emits long breakout and long reversion signals across 1h/4h/12h/24h.
 ```sh
 python -m cohort_metrics.state  --input habitual_overlaps.csv --out data/state  --windows 1h,4h,12h,24h
 python -m cohort_metrics.regime --input habitual_overlaps.csv --out data/regime --windows 3d,7d,14d,30d,90d
