@@ -6,11 +6,18 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import sys
+from pathlib import Path
 
 try:
     import yaml  # type: ignore
 except Exception:
     yaml = None
+
+# Ensure repo root on sys.path so 'cohort_metrics' is importable even when run from tools/
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 # Reuse helpers from core
 from cohort_metrics.core import resolve_input_path, normalize_ohlcv_columns
