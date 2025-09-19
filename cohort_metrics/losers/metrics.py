@@ -28,6 +28,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-baseline", action="store_true", help="Skip baseline enrichment and only output current metrics")
     p.add_argument("--emit-series", action="store_true", help="Also emit per-window metrics time series")
     p.add_argument("--series-output", default="losers_metrics_series.csv", help="Output CSV path for metrics time series")
+    p.add_argument("--dense", action="store_true", help="Emit dense per-minute rolling metrics")
+    p.add_argument("--dense-windows", help="CSV windows for dense mode (e.g., 60,240,720,1440)")
+    p.add_argument("--dense-output", default="losers_metrics_dense.csv", help="Output CSV path for dense metrics")
     return p.parse_args()
 
 
@@ -35,6 +38,26 @@ def main() -> None:
     args = parse_args()
     input_path = resolve_input_path(args.input)
     current_df = compute_cohort_metrics(input_path, args.output)
+    # Optionally emit time series of window metrics
+    if bool(args.emit_series):
+        from cohort_metrics.core import compute_cohort_metrics_series, WINDOWS_MINUTES
+        compute_cohort_metrics_series(input_path, args.series_output, windows_minutes=WINDOWS_MINUTES)
+    # Optionally emit dense per-minute rolling metrics
+    if bool(args.dense):
+        from cohort_metrics.core import compute_cohort_metrics_dense, WINDOWS_MINUTES
+        if args.dense_windows:
+            wins = []
+            for p in str(args.dense_windows).split(','):
+                p = p.strip().lower()
+                if not p:
+                    continue
+                if p.endswith('h'):
+                    wins.append(int(float(p[:-1]) * 60))
+                else:
+                    wins.append(int(p))
+        else:
+            wins = WINDOWS_MINUTES
+        compute_cohort_metrics_dense(input_path, args.dense_output, windows_minutes=wins)
     # Optionally emit time series of window metrics
     if bool(args.emit_series):
         from cohort_metrics.core import compute_cohort_metrics_series, WINDOWS_MINUTES

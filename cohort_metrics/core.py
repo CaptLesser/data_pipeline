@@ -935,6 +935,84 @@ def compute_cohort_metrics_series(
     return result
 
 
+def _parse_windows_arg(arg: Optional[str], default_minutes: Iterable[int]) -> List[int]:
+    if arg is None or str(arg).strip() == "":
+        return list(default_minutes)
+    parts = [p.strip().lower() for p in str(arg).split(",") if p.strip()]
+    out: List[int] = []
+    for p in parts:
+        if p.endswith("h"):
+            out.append(int(float(p[:-1]) * 60))
+        elif p.endswith("min"):
+            out.append(int(p[:-3]))
+        elif p.endswith("m"):
+            out.append(int(p[:-1]))
+        else:
+            out.append(int(p))
+    return out
+
+
+def compute_cohort_metrics_dense(
+    input_csv: str,
+    output_csv: str,
+    windows_minutes: Iterable[int] = WINDOWS_MINUTES,
+    min_fraction: float = 0.8,
+    start_ts: Optional[str] = None,
+    end_ts: Optional[str] = None,
+) -> pd.DataFrame:
+    """Compute per-minute rolling metrics (dense mode) for selected windows.
+
+    - Emits one row per (symbol, timestamp) present in the input minute bars.
+    - For each timestamp, computes metrics for each requested window using the
+      same feature family as compute_window_metrics with prealigned=True.
+    - Joins all window-suffixed metrics into a single wide row.
+    - Intended for ML pipelines where features must align to every minute bar.
+    """
+    df = pd.read_csv(input_csv)
+    if df.empty:
+        result = pd.DataFrame(columns=["symbol", "timestamp"])  # empty template
+        result.to_csv(output_csv, index=False)
+        return result
+
+    # Parse timestamps
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    if start_ts:
+        start = pd.to_datetime(start_ts, utc=True, errors="coerce")
+        if pd.notna(start):
+            df = df[df["timestamp"] >= start]
+    if end_ts:
+        end = pd.to_datetime(end_ts, utc=True, errors="coerce")
+        if pd.notna(end):
+            df = df[df["timestamp"] <= end]
+
+    rows: List[Dict[str, float]] = []
+    for sym, g in df.groupby("symbol"):
+        g = g.dropna(subset=["timestamp"]).sort_values("timestamp")
+        if g.empty:
+            continue
+        ts_list = g["timestamp"].unique().tolist()
+        for ts in ts_list:
+            row: Dict[str, float] = {"symbol": sym, "timestamp": ts}
+            # For each window, slice trailing data and compute metrics
+            for w in windows_minutes:
+                sfx = SUFFIX.get(w, f"{w}m")
+                start = ts - pd.to_timedelta(w, unit="m")
+                win = g[(g["timestamp"] > start) & (g["timestamp"] <= ts)]
+                if win.empty:
+                    # Fill with empty window metrics schema for consistency
+                    m = compute_window_metrics(pd.DataFrame(columns=["timestamp","open","high","low","close","volume"]), w, sfx, min_fraction=min_fraction, prealigned=True)
+                else:
+                    m = compute_window_metrics(win.copy(), w, sfx, min_fraction=min_fraction, prealigned=True)
+                # Merge
+                row.update(m)
+            rows.append(row)
+
+    result = pd.DataFrame(rows)
+    result.to_csv(output_csv, index=False)
+    return result
+
+
 def resolve_input_path(path: str, search_dir: Optional[str] = None, exts: Tuple[str, ...] = (".csv", ".parquet")) -> str:
     """Resolve a possibly misspelled or case-variant file path.
 
