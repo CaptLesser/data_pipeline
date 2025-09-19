@@ -198,9 +198,89 @@ python -m cohort_metrics.regime --input habitual_<cohort>.csv --out data/regime 
 Notes:
 - Rules engine is creation-only: it emits entry/stop/targets/hold/tags/notes; scoring/risk-curve is a separate stage.
 - Use the same pipeline for all cohorts; simply point to the appropriate metrics and IMF files.
+
+## ML Workflow (Dense Minute Grid)
+
+This repository includes an ML training pipeline that consumes cohort CSVs and their metrics series to produce CPU-based models, calibration artifacts, and per-horizon predictions.
+
+Highlights
+- Dense join: backward-only merge_asof from metrics_series onto minute OHLCVT; hygiene flags enforced.
+- Labels: price/return/direction/vol/event with future-only windows (t+1..t+H); training-split percentiles for squeeze/spike.
+- Models: RF, HGBT, Logistic Regression, Elastic Net (XGB/LGBM/Cat optional). CPU by default; omit --gpu.
+- CV: PurgedKFold with embargo; optional refit caps n_estimators to mean CV best-iteration.
+- Calibration/thresholds: Platt/Isotonic (binary); thresholds by F1/MCC or Expected Value (--select-by ev).
+- Artifacts: model.pkl, metrics.json, params.json, features_used.txt, column_map.json (git_sha, thresholds/spec, universe), predictions.parquet per horizon.
+
+### Generate Metrics Series for ML
+
+Example for overlaps (repeat for gainers/losers as needed):
+
 ```sh
-python -m cohort_metrics.state  --input habitual_overlaps.csv --out data/state  --windows 1h,4h,12h,24h
-python -m cohort_metrics.regime --input habitual_overlaps.csv --out data/regime --windows 3d,7d,14d,30d,90d
+python -m cohort_metrics.overlaps.metrics \
+  --input habitual_overlaps.csv \
+  --output overlap_metrics.csv \
+  --emit-series --series-output overlap_metrics_series.csv \
+  --windows 1h,4h,12h,24h --no-baseline --impute-neutral
+```
+
+### Train (CPU)
+
+Core CLI:
+
+```sh
+python tools/train.py \
+  --model <rf|hgbt|logreg|enet|xgb|lgbm|cat> \
+  --task <price|return|direction|vol|event> \
+  --input-metrics overlap_metrics_series.csv \
+  --input-ohlcvt habitual_overlaps.csv \
+  [--horizons 1,5,15,60] [--features min|max] [--lags 60] \
+  [--cross-asset ranks|spreads|both] [--universe-fixed] [--rank-top N] \
+  [--calibrate platt|isotonic] [--select-by ev|f1|mcc] [--fee-bps 2 --slip-bps 2] \
+  [--cv 5] [--cv-refit] [--perm-imp 5] [--symbol-cat]
+```
+
+Per horizon outputs: `models/<task>/<model>/<run_id>/H=<H>/predictions.parquet` (+ model/metrics/params/column_map).
+
+### Validate & Predict
+
+Schema check for a dataset vs. saved model:
+
+```sh
+python tools/validate_artifacts.py --model-dir models/direction/hgbt/<run>/H=60 --dataset my_eval.csv
+```
+
+Batch inference from a model directory:
+
+```sh
+python tools/predict.py --model-dir models/direction/hgbt/<run>/H=60 --dataset my_eval.csv --task direction --classes 2
+```
+
+## End-to-End Test (CPU, small dataset, top 2 assets)
+
+This PowerShell command runs the pipeline from leaderboards → metrics_series → multiple ML trainings and writes per-horizon predictions (no GPU). It restricts cross-asset features to a fixed universe of the top-2 assets by median 24h quote volume in training.
+
+```powershell
+# 1) Leaderboards (fill in DB creds)
+$HOST="localhost"; $USER="YOUR_USER"; $DB="YOUR_DB"; $PASS="YOUR_PASS";
+python leaderboards.py --host $HOST --user $USER --database $DB --port 3306 --password $PASS --top-n 20;
+
+# 2) Metrics series for overlaps
+python -m cohort_metrics.overlaps.metrics --input habitual_overlaps.csv --output overlap_metrics.csv --emit-series --series-output overlap_metrics_series.csv --windows 1h,4h,12h,24h --no-baseline --impute-neutral;
+
+# 3) Train several CPU models over horizons 1,5,15,60 on top-2 assets only (fixed universe)
+# Return (regression) with HGBT
+python tools/train.py --model hgbt --task return --input-metrics overlap_metrics_series.csv --input-ohlcvt habitual_overlaps.csv --wins 1h,4h,12h,24h --features max --lags 60 --cross-asset ranks --universe-fixed --rank-top 2 --cv 3 --cv-refit --perm-imp 3 --perm-imp-sample 500;
+
+# Direction (binary) with calibration + EV thresholding (fees/slippage 2 bps each)
+python tools/train.py --model logreg --task direction --classes 2 --input-metrics overlap_metrics_series.csv --input-ohlcvt habitual_overlaps.csv --wins 1h,4h,12h,24h --features max --lags 60 --cross-asset ranks --universe-fixed --rank-top 2 --calibrate platt --select-by ev --fee-bps 2 --slip-bps 2 --cv 3 --cv-refit;
+
+# Event (squeeze) with RF + EV thresholding (payoff=1, penalty=1)
+python tools/train.py --model rf --task event --event squeeze --input-metrics overlap_metrics_series.csv --input-ohlcvt habitual_overlaps.csv --wins 1h,4h,12h,24h --features max --lags 60 --cross-asset ranks --universe-fixed --rank-top 2 --select-by ev --ev-event-payoff 1 --ev-event-penalty 1 --cv 3 --cv-refit;
+
+# Volatility (regression) with Elastic Net
+python tools/train.py --model enet --task vol --input-metrics overlap_metrics_series.csv --input-ohlcvt habitual_overlaps.csv --wins 1h,4h,12h,24h --features max --lags 60 --cross-asset ranks --universe-fixed --rank-top 2;
+
+# Per-horizon predictions are saved to models/<task>/<model>/<run_id>/H=<H>/predictions.parquet
 ```
 
 ### 1) Generate Leaderboards from MySQL

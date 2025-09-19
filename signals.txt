@@ -1,0 +1,8 @@
+[DRVUSD]
+- 1h long_breakout (setup): hold_min=1440, target1=0.0351, tags=trend,strong_adx,pre_breakout
+
+[GHIBLIUSD]
+- 12h long_breakout (setup): hold_min=1440, target1=0.00189864, tags=trend,strong_adx,abnormal_flow,pre_breakout
+
+[NODLUSD]
+- 4h long_breakout (trigger): hold_min=1440, target1=0.00044701, tags=trend,strong_adx
