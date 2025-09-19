@@ -176,8 +176,8 @@ def _target_resample_rule(window_size: int) -> Optional[str]:
     if mins is None:
         return None
     if mins % 60 == 0:
-        return f"{mins // 60}H"
-    return f"{mins}T"
+        return f"{mins // 60}h"
+    return f"{mins}min"
 
 
 def compute_window_metrics(
@@ -213,7 +213,7 @@ def compute_window_metrics(
     if prealigned:
         win = df
     else:
-        bucket_rule = f"{window_size // 60}H" if window_size % 60 == 0 else f"{window_size}T"
+        bucket_rule = f"{window_size // 60}h" if window_size % 60 == 0 else f"{window_size}min"
         end_bucket = df.index.max().floor(bucket_rule)
         win_start = end_bucket - pd.to_timedelta(window_size, unit="m")
         win = df[(df.index > win_start) & (df.index <= end_bucket)]
@@ -529,9 +529,9 @@ def compute_metrics_series(
     # Build window buckets aligned to UTC boundaries
     # Convert minutes to pandas offset string (H for hours when divisible by 60)
     if window_size % 60 == 0:
-        freq = f"{window_size // 60}H"
+        freq = f"{window_size // 60}h"
     else:
-        freq = f"{window_size}T"
+        freq = f"{window_size}min"
 
     # Map each row to its window start
     win_start = df.index.floor(freq)
@@ -767,7 +767,7 @@ def compute_symbol_metrics(symbol_df: pd.DataFrame, windows_minutes: Iterable[in
             # Compute last complete bucket for each window and take the minimum
             anchors = []
             for w in windows_minutes:
-                rule = f"{w // 60}H" if w % 60 == 0 else f"{w}T"
+                rule = f"{w // 60}h" if w % 60 == 0 else f"{w}min"
                 anchors.append(tmax.floor(rule))
             anchor = min(anchors) if anchors else tmax
             out["timestamp_asof_utc"] = anchor.to_pydatetime()

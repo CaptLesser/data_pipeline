@@ -50,7 +50,7 @@ def compute_state_snapshot(
         tmax = df["timestamp"].max()
         anchors = []
         for w in windows_minutes:
-            rule = f"{w // 60}H" if w % 60 == 0 else f"{w}T"
+            rule = f"{w // 60}h" if w % 60 == 0 else f"{w}min"
             anchors.append(tmax.floor(rule))
         asof = min(anchors) if anchors else tmax
 
@@ -267,7 +267,7 @@ def main() -> None:
         tmax = df["timestamp"].max()
         anchors = []
         for w in windows:
-            rule = f"{w // 60}H" if w % 60 == 0 else f"{w}T"
+            rule = f"{w // 60}h" if w % 60 == 0 else f"{w}min"
             anchors.append(tmax.floor(rule))
         asof = min(anchors)
 
