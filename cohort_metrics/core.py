@@ -862,7 +862,12 @@ def compute_symbol_metrics(symbol_df: pd.DataFrame, windows_minutes: Iterable[in
     return out
 
 
-def compute_cohort_metrics(input_csv: str, output_csv: str, windows_minutes: Iterable[int] = WINDOWS_MINUTES) -> pd.DataFrame:
+def compute_cohort_metrics(
+    input_csv: str,
+    output_csv: str,
+    windows_minutes: Iterable[int] = WINDOWS_MINUTES,
+    impute_neutral: bool = False,
+) -> pd.DataFrame:
     """Read a cohort CSV (symbol,timestamp,open,high,low,close,volume) and
     write per-symbol metrics to output_csv. Returns the DataFrame written.
     """
@@ -888,6 +893,8 @@ def compute_cohort_metrics(input_csv: str, output_csv: str, windows_minutes: Ite
         rows.append(metrics_row)
 
     result = pd.DataFrame(rows)
+    if impute_neutral:
+        result = impute_neutral_metrics(result)
     result.to_csv(output_csv, index=False)
     return result
 
@@ -897,6 +904,7 @@ def compute_cohort_metrics_series(
     output_csv: str,
     windows_minutes: Iterable[int] = WINDOWS_MINUTES,
     min_fraction: float = 0.8,
+    impute_neutral: bool = False,
 ) -> pd.DataFrame:
     """Compute a time series of metrics per symbol and per non-overlapping window.
 
@@ -931,6 +939,8 @@ def compute_cohort_metrics_series(
             all_rows.append(out)
 
     result = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame(columns=["symbol", "window", "window_start", "window_end", "timestamp"])
+    if impute_neutral:
+        result = impute_neutral_metrics(result)
     result.to_csv(output_csv, index=False)
     return result
 
@@ -959,6 +969,7 @@ def compute_cohort_metrics_dense(
     min_fraction: float = 0.8,
     start_ts: Optional[str] = None,
     end_ts: Optional[str] = None,
+    impute_neutral: bool = False,
 ) -> pd.DataFrame:
     """Compute per-minute rolling metrics (dense mode) for selected windows.
 
@@ -1009,8 +1020,86 @@ def compute_cohort_metrics_dense(
             rows.append(row)
 
     result = pd.DataFrame(rows)
+    if impute_neutral:
+        result = impute_neutral_metrics(result)
     result.to_csv(output_csv, index=False)
     return result
+
+
+def impute_neutral_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """Impute neutral values for numeric metrics to eliminate NaNs for ML.
+
+    Rules (mirrors state/regime imputation):
+      - *_pctile = 50.0
+      - *_quintile = 3
+      - *_rz, *_abs_rz = 0.0
+      - *_pos = 0.5
+      - *_dir = 0.0
+      - *_over_* = 1.0
+      - *_minus_* = 0.0
+      - dist_*_mag and *_mag = 0.0 (or p50 if provided; fallback 0.0)
+      - All other numeric metrics: 0.0
+    Also emits {col}_imputed flags (0/1) per column imputed.
+    """
+    out = df.copy()
+    import numpy as _np
+    import pandas as _pd
+
+    def fill(col: str, neutral) -> None:
+        if col not in out.columns:
+            return
+        s = out[col]
+        if not _pd.api.types.is_numeric_dtype(s):
+            return
+        vals = s.to_numpy(dtype=float)
+        mask = ~_np.isfinite(vals)
+        flag_col = f"{col}_imputed"
+        if mask.any():
+            out[col] = s.astype(float)
+            out.loc[mask, col] = neutral
+            out[flag_col] = 0
+            out.loc[mask, flag_col] = 1
+        else:
+            out[flag_col] = 0
+
+    # Iterate all numeric columns and apply family-specific rules
+    for col in list(out.columns):
+        if col in ("symbol",):
+            continue
+        if any(col.startswith(p) for p in ("timestamp_asof", "window_coverage_", "window_ok_", "metrics_valid_", "window_start", "window_end", "timestamp")):
+            # Skip flags/timestamps
+            continue
+        # Percentile/quintile/z families
+        if col.endswith("_pctile"):
+            fill(col, 50.0); continue
+        if col.endswith("_quintile"):
+            fill(col, 3); continue
+        if col.endswith("_rz") or col.endswith("_abs_rz"):
+            fill(col, 0.0); continue
+        # Positions/dirs
+        if col.endswith("_pos"):
+            fill(col, 0.5); continue
+        if col.endswith("_dir"):
+            fill(col, 0.0); continue
+        # Ratios/differences
+        if "_over_" in col:
+            fill(col, 1.0); continue
+        if "_minus_" in col:
+            fill(col, 0.0); continue
+        # Magnitudes & distances
+        if col.startswith("dist_") or col.endswith("_mag"):
+            # Try p50 sidecar if present
+            p50_col = f"{col}_p50"
+            neutral = 0.0
+            if p50_col in out.columns:
+                try:
+                    neutral = float(out[p50_col].fillna(0.0).iloc[0])
+                except Exception:
+                    neutral = 0.0
+            fill(col, neutral); continue
+        # All other numeric metrics -> 0.0
+        fill(col, 0.0)
+    return out
 
 
 def resolve_input_path(path: str, search_dir: Optional[str] = None, exts: Tuple[str, ...] = (".csv", ".parquet")) -> str:
