@@ -96,6 +96,22 @@ python tools/rules_engine.py \\
 - Outputs: `signals.csv` (multi-row per asset) and optional `signals.txt` play cards.
 - Defaults: emits long breakout and long reversion signals across 1h/4h/12h/24h.
 
+
+### Run All Cohorts End-to-End (Leaderboard -> Signals)
+
+One command to process overlaps, gainers, and losers through metrics -> IMF -> rule-based signals.
+
+```sh
+python tools/run_all_cohorts.py \\
+  --host <MYSQL_HOST> --user <MYSQL_USER> --database <DB_NAME> --port 3306 --password '<PASSWORD>' \\
+  --months 3 --table ohlcvt --top-n 20 \\
+  --timeframes 1h,4h,12h,24h --write-cards
+```
+
+Flags:
+- --skip-leaderboards to reuse existing habitual_*.csv files
+- --cohorts overlaps,gainers,losers to select a subset
+
 ### Cohort Playbooks (Gainers, Losers, Overlaps)
 
 The same analysis pathway is available for each cohort. Swap the file names per cohort.
