@@ -46,7 +46,7 @@ def main() -> None:
         cmd = [py, "leaderboards.py", "--host", args.host, "--user", args.user, "--database", args.database, "--port", str(args.port)]
         if args.password:
             cmd.extend(["--password", args.password])
-        cmd.extend(["--top-n", str(args["top_n"])]) if isinstance(args, dict) and "top_n" in args else cmd.extend(["--top-n", str(args.top_n)])
+        cmd.extend(["--top-n", str(args.top_n)])
         run(cmd)
 
     # 1) Per-cohort
@@ -88,4 +88,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

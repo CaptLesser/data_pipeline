@@ -220,6 +220,9 @@ def rules_for_timeframe(row: pd.Series,
                 stop_band = float(upper) - cfg["stops"]["band_buffer_atr"] * float(atr)
             stop_candidates = [s for s in [stop_atr, stop_band] if isinstance(s, (int, float)) and math.isfinite(s)]
             stop = max(stop_candidates) if stop_candidates else stop_atr
+            # Clamp breakout stop to not exceed entry (ensure protective stop is below entry)
+            if isinstance(stop, (int, float)) and isinstance(entry, (int, float)) and math.isfinite(stop) and math.isfinite(entry):
+                stop = min(stop, entry)
             t1_pct = min(float(amp) if math.isfinite(amp) else cfg["targets"]["default_t1_pct"], cfg["targets"]["roi_cap_pct"])
             t2_pct = 1.5 * t1_pct if (macro_align and math.isfinite(amp) and amp > 20.0) else None
             exp_hold = float(dur) if (math.isfinite(dur) and dur > 0) else cfg["timing"]["default_hold_min"]
@@ -289,6 +292,9 @@ def rules_for_timeframe(row: pd.Series,
                     stop = max(stop_candidates)
             else:
                 stop = stop_atr
+            # Clamp reversion stop to not exceed entry (ensure protective stop is below entry)
+            if isinstance(stop, (int, float)) and isinstance(entry, (int, float)) and math.isfinite(stop) and math.isfinite(entry):
+                stop = min(stop, entry)
             # Favor small amplitude targets for reversion if IMF small; else cap by ROI cap
             base_amp = float(amp) if math.isfinite(amp) else cfg["targets"]["default_t1_pct"]
             t1_pct = min(base_amp, cfg["targets"]["roi_cap_pct"])

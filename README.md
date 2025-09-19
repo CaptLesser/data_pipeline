@@ -97,6 +97,29 @@ python tools/rules_engine.py \\
 - Defaults: emits long breakout and long reversion signals across 1h/4h/12h/24h.
 
 
+### Metrics Modes and Neutral Imputation
+
+- Snapshot (default): one row per symbol at a common as-of time.
+- Series (--emit-series): one row per non-overlapping window end per symbol (UTC-aligned).
+- Dense (--dense): per-minute rolling metrics per symbol for selected windows (compute‑heavy).
+
+Windows:
+- Use --windows (e.g., 1h,4h,12h,24h) for snapshot/series. Dense reuses --windows unless --dense-windows is provided.
+
+Neutral imputation (NaN-free features):
+- Add --impute-neutral to snapshot/series/dense to fill neutrals and emit *_imputed flags.
+  - *_pctile=50.0, *_quintile=3, *_rz/_abs_rz=0.0, *_pos=0.5, *_dir=0.0,
+    ratios=1.0, differences=0.0, magnitudes/distances=p50 (if available) else 0.0, others=0.0.
+
+Examples:
+```sh
+python -m cohort_metrics.overlaps.metrics --input habitual_overlaps.csv --output overlap_metrics.csv --windows 1h,4h,12h,24h --impute-neutral
+
+python -m cohort_metrics.overlaps.metrics --input habitual_overlaps.csv --output overlap_metrics.csv --emit-series --series-output overlap_metrics_series.csv --windows 1h,4h,12h,24h --impute-neutral
+
+python -m cohort_metrics.overlaps.metrics --input habitual_overlaps.csv --output overlap_metrics.csv --dense --dense-windows 60,240 --dense-output overlap_metrics_dense.csv --impute-neutral
+```
+
 ### Run All Cohorts End-to-End (Leaderboard -> Signals)
 
 One command to process overlaps, gainers, and losers through metrics -> IMF -> rule-based signals.
