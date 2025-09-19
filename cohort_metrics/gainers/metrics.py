@@ -6,6 +6,7 @@ from cohort_metrics.core import (
     build_symbol_baseline,
     enrich_current_with_baseline,
     resolve_input_path,
+    _parse_windows_arg,
 )
 from cohort_metrics.db import get_db_engine, fetch_history_months
 
@@ -31,32 +32,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dense", action="store_true", help="Emit dense per-minute rolling metrics")
     p.add_argument("--dense-windows", help="CSV windows for dense mode (e.g., 60,240,720,1440)")
     p.add_argument("--dense-output", default="gainers_metrics_dense.csv", help="Output CSV path for dense metrics")
+    p.add_argument("--windows", help="CSV windows for snapshot/series (e.g., 1h,4h,12h,24h)")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     input_path = resolve_input_path(args.input)
-    current_df = compute_cohort_metrics(input_path, args.output)
+    from cohort_metrics.core import WINDOWS_MINUTES
+    wins_base = _parse_windows_arg(args.windows, WINDOWS_MINUTES)
+    current_df = compute_cohort_metrics(input_path, args.output, windows_minutes=wins_base)
     # Optionally emit time series of window metrics
     if bool(args.emit_series):
-        from cohort_metrics.core import compute_cohort_metrics_series, WINDOWS_MINUTES
-        compute_cohort_metrics_series(input_path, args.series_output, windows_minutes=WINDOWS_MINUTES)
+        from cohort_metrics.core import compute_cohort_metrics_series
+        compute_cohort_metrics_series(input_path, args.series_output, windows_minutes=wins_base)
     # Optionally emit dense per-minute rolling metrics
     if bool(args.dense):
-        from cohort_metrics.core import compute_cohort_metrics_dense, WINDOWS_MINUTES
-        if args.dense_windows:
-            wins = []
-            for p in str(args.dense_windows).split(','):
-                p = p.strip().lower()
-                if not p:
-                    continue
-                if p.endswith('h'):
-                    wins.append(int(float(p[:-1]) * 60))
-                else:
-                    wins.append(int(p))
-        else:
-            wins = WINDOWS_MINUTES
+        from cohort_metrics.core import compute_cohort_metrics_dense
+        wins = _parse_windows_arg(args.dense_windows, wins_base)
         compute_cohort_metrics_dense(input_path, args.dense_output, windows_minutes=wins)
     # Optionally emit time series of window metrics
     if bool(args.emit_series):
