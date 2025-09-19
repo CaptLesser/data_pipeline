@@ -892,6 +892,49 @@ def compute_cohort_metrics(input_csv: str, output_csv: str, windows_minutes: Ite
     return result
 
 
+def compute_cohort_metrics_series(
+    input_csv: str,
+    output_csv: str,
+    windows_minutes: Iterable[int] = WINDOWS_MINUTES,
+    min_fraction: float = 0.8,
+) -> pd.DataFrame:
+    """Compute a time series of metrics per symbol and per non-overlapping window.
+
+    Produces a long-format DataFrame with rows at each window end (UTC-aligned),
+    safe to join to OHLCVT by joining on (symbol, timestamp=window_end).
+
+    Columns include: symbol, window (suffix), window_start, window_end, and the
+    same metrics as compute_window_metrics for that window.
+    """
+    df = pd.read_csv(input_csv)
+    if df.empty:
+        result = pd.DataFrame(columns=["symbol", "window", "window_start", "window_end"])  # empty template
+        result.to_csv(output_csv, index=False)
+        return result
+
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+
+    all_rows: List[pd.DataFrame] = []
+    for sym, g in df.groupby("symbol"):
+        for w in windows_minutes:
+            sfx = SUFFIX.get(w, f"{w}m")
+            series_df = compute_metrics_series(g.copy(), w, sfx, min_fraction=min_fraction)
+            if series_df.empty:
+                continue
+            out = series_df.copy()
+            out.insert(0, "window", sfx)
+            out.insert(0, "symbol", sym)
+            # Add a join-friendly timestamp equal to window_end
+            if "window_end" in out.columns and "timestamp" not in out.columns:
+                out["timestamp"] = out["window_end"]
+            all_rows.append(out)
+
+    result = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame(columns=["symbol", "window", "window_start", "window_end", "timestamp"])
+    result.to_csv(output_csv, index=False)
+    return result
+
+
 def resolve_input_path(path: str, search_dir: Optional[str] = None, exts: Tuple[str, ...] = (".csv", ".parquet")) -> str:
     """Resolve a possibly misspelled or case-variant file path.
 

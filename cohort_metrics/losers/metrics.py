@@ -26,6 +26,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--password", help="MySQL password (prompt if omitted)")
     p.add_argument("--table", default="ohlcvt", help="OHLCVT table name")
     p.add_argument("--no-baseline", action="store_true", help="Skip baseline enrichment and only output current metrics")
+    p.add_argument("--emit-series", action="store_true", help="Also emit per-window metrics time series")
+    p.add_argument("--series-output", default="losers_metrics_series.csv", help="Output CSV path for metrics time series")
     return p.parse_args()
 
 
@@ -33,6 +35,10 @@ def main() -> None:
     args = parse_args()
     input_path = resolve_input_path(args.input)
     current_df = compute_cohort_metrics(input_path, args.output)
+    # Optionally emit time series of window metrics
+    if bool(args.emit_series):
+        from cohort_metrics.core import compute_cohort_metrics_series, WINDOWS_MINUTES
+        compute_cohort_metrics_series(input_path, args.series_output, windows_minutes=WINDOWS_MINUTES)
 
     if args.no_baseline or current_df.empty:
         return
