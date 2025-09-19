@@ -95,6 +95,70 @@ python tools/rules_engine.py \\
 
 - Outputs: `signals.csv` (multi-row per asset) and optional `signals.txt` play cards.
 - Defaults: emits long breakout and long reversion signals across 1h/4h/12h/24h.
+
+### Cohort Playbooks (Gainers, Losers, Overlaps)
+
+The same analysis pathway is available for each cohort. Swap the file names per cohort.
+
+1) Metrics (asset-relative, baseline-enriched)
+
+```sh
+# Overlaps
+python -m cohort_metrics.overlaps.metrics --input habitual_overlaps.csv --output overlap_metrics.csv --months 3 --host <MYSQL_HOST> --user <MYSQL_USER> --database <DB_NAME> --port 3306 --table ohlcvt
+
+# Gainers
+python -m cohort_metrics.gainers.metrics  --input habitual_gainers.csv  --output gainers_metrics.csv  --months 3 --host <MYSQL_HOST> --user <MYSQL_USER> --database <DB_NAME> --port 3306 --table ohlcvt
+
+# Losers
+python -m cohort_metrics.losers.metrics   --input habitual_losers.csv   --output losers_metrics.csv   --months 3 --host <MYSQL_HOST> --user <MYSQL_USER> --database <DB_NAME> --port 3306 --table ohlcvt
+```
+
+2) IMF clustering (cycle profiles)
+
+```sh
+# Overlaps
+python imf_cluster_overlaps.py    # -> imf_clusters_overlaps.json / .txt
+
+# Gainers
+python imf_cluster_gainers.py     # -> imf_clusters_gainers.json  / .txt
+
+# Losers
+python imf_cluster_losers.py      # -> imf_clusters_losers.json   / .txt
+```
+
+3) Rule-based signal generation (human-readable, multiple signals per asset)
+
+```sh
+# Overlaps
+python tools/rules_engine.py \
+  --metrics overlap_metrics.csv \
+  --imf-json imf_clusters_overlaps.json \
+  [--regime data/regime/dt=YYYY-MM-DD/regime_snapshot.parquet] \
+  [--timeframes 1h,4h,12h,24h] [--config rules_config.yaml] [--write-cards]
+
+# Gainers
+python tools/rules_engine.py \
+  --metrics gainers_metrics.csv \
+  --imf-json imf_clusters_gainers.json \
+  [--regime data/regime/dt=YYYY-MM-DD/regime_snapshot.parquet]
+
+# Losers
+python tools/rules_engine.py \
+  --metrics losers_metrics.csv \
+  --imf-json imf_clusters_losers.json \
+  [--regime data/regime/dt=YYYY-MM-DD/regime_snapshot.parquet]
+```
+
+Optional context (joinable into scorer later):
+
+```sh
+python -m cohort_metrics.state  --input habitual_<cohort>.csv --out data/state  --windows 1h,4h,12h,24h
+python -m cohort_metrics.regime --input habitual_<cohort>.csv --out data/regime --windows 3d,7d,14d,30d,90d
+```
+
+Notes:
+- Rules engine is creation-only: it emits entry/stop/targets/hold/tags/notes; scoring/risk-curve is a separate stage.
+- Use the same pipeline for all cohorts; simply point to the appropriate metrics and IMF files.
 ```sh
 python -m cohort_metrics.state  --input habitual_overlaps.csv --out data/state  --windows 1h,4h,12h,24h
 python -m cohort_metrics.regime --input habitual_overlaps.csv --out data/regime --windows 3d,7d,14d,30d,90d
